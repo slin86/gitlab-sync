@@ -1,0 +1,30 @@
+# Kopieren nach config.yaml und anpassen.
+# Relative Pfade gelten relativ zu dieser Datei; ~ und $VARS werden aufgeloest.
+
+# Wurzelverzeichnis mit der verschachtelten Ordnerstruktur (jedes Verzeichnis mit .git ist ein Repo)
+root: ~/work/gitlab
+
+# Hosts: origin muss auf new_host zeigen; die URL des alten GitLab entsteht,
+# indem nur der Host durch old_host ersetzt wird (Pfad/Protokoll/User bleiben).
+new_host: gitlab.example.com
+old_host: git.example.com
+
+# Remote-Namen
+new_remote: origin      # neues GitLab (Ziel)
+old_remote: git-old     # altes GitLab (Quelle), wird bei Bedarf angelegt
+
+# Optionale Filter auf den Pfad relativ zu root (fnmatch-Globs, '*' matcht auch '/')
+include: []
+exclude:
+  # - "archiv/*"
+
+log_file: gitlab-sync.log
+
+# true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)
+dry_run: false
+
+# Nach dem Sync pro Repo den urspruenglich ausgecheckten Branch wiederherstellen
+restore_branch: true
+
+# Timeout je git-Befehl in Sekunden
+git_timeout: 600
