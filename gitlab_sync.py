@@ -2,6 +2,8 @@
 """Synchronisiert lokal ausgecheckte Repos von einem alten GitLab (git.example.com)
 in das neue GitLab (gitlab.example.com).
 
+# --> Offen: Repos, die in git erstellt wurden, aber noch nicht in giutlab
+
 Pro Repo:
   1. fetch vom neuen GitLab (origin)
   2. altes GitLab als zusaetzlichen Remote anlegen (falls nicht vorhanden)
@@ -42,6 +44,7 @@ class Config:
     old_remote: str = "git-old"
     include: List[str] = field(default_factory=list)
     exclude: List[str] = field(default_factory=list)
+    exclude_branches: List[str] = field(default_factory=list)
     log_file: Path = Path("gitlab-sync.log")
     dry_run: bool = False
     restore_branch: bool = True
@@ -68,6 +71,7 @@ def load_config(path: Path) -> Config:
         old_remote=raw.get("old_remote", "git-old"),
         include=list(raw.get("include") or []),
         exclude=list(raw.get("exclude") or []),
+        exclude_branches=list(raw.get("exclude_branches") or []),
         log_file=p(raw.get("log_file", "gitlab-sync.log")),
         dry_run=bool(raw.get("dry_run", False)),
         restore_branch=bool(raw.get("restore_branch", True)),
@@ -257,6 +261,9 @@ def sync_repo(path: Path, cfg: Config, log: Log, d: int, stats: Stats,
             log.line(d + 1, f"{len(only_new)} Branch(es) nur in {new} (bleiben unveraendert)")
 
         for b in old_branches:
+            if any(fnmatch.fnmatchcase(b, pat) for pat in cfg.exclude_branches):
+                log.line(d + 2, f"Branch {b}: uebersprungen (exclude_branches)")
+                continue
             try:
                 _sync_branch(git, cfg, log, d + 1, stats, b, created_local, path)
             except GitError as e:

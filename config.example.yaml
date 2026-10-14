@@ -18,6 +18,9 @@ include: []
 exclude:
   # - "archiv/*"
 
+# Branch-Namen, die in allen Repos nicht gesynct werden (fnmatch-Globs, z.B. "wip/*")
+exclude_branches: [dependabot*, renovate/*]
+
 log_file: gitlab-sync.log
 
 # true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)

@@ -128,6 +128,12 @@ class SyncTests(unittest.TestCase):
         git(self.new, "show", "main:n")
         git(self.new, "show", "main:b")  # beide Seiten enthalten
 
+    def test_exclude_branches(self):
+        self.cfg.exclude_branches = ["feat*"]
+        self.run_sync(False)
+        self.assertNotIn("feature", self.heads(self.new).split())
+        self.assertEqual(git(self.new, "rev-parse", "main"), git(self.old, "rev-parse", "main"))
+
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]
         self.assertEqual(gs.discover(self.cfg, []), [self.repo])
