@@ -29,10 +29,11 @@ Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeich
    - sonst Fast-Forward, falls möglich, andernfalls Merge-Commit; bei Konflikt `merge --abort`,
      Eintrag `[KONFLIKT]` im Protokoll, weiter mit dem nächsten Branch
    - Push nach `origin` (Dry-Run: Merge wird lokal getestet und danach zurückgesetzt, nur der Push entfällt)
-4. neue Tags übertragen; Tags mit gleichem Namen, aber anderem Commit werden nie überschrieben (nur Warnung)
+4. neue Tags übertragen; Tags mit gleichem Namen, aber anderem Commit werden mit `overwrite_tags: true`
+   im neuen GitLab überschrieben (alt → neu, Force-Push nur für diese Tags), sonst nur Warnung
 5. ursprünglich ausgecheckten Branch wiederherstellen (`restore_branch`)
 
-Es wird nie ein Branch oder Tag gelöscht und nie force-gepusht. Branches, die nur im neuen GitLab
+Es wird nie ein Branch oder Tag gelöscht und kein Branch force-gepusht (Force-Push nur für abweichende Tags bei `overwrite_tags`). Branches, die nur im neuen GitLab
 existieren, bleiben unverändert. Ein lokaler Branch mit unveröffentlichten Commits wird übersprungen (Warnung).
 
 ## API-Vorabpruefung (optional)
@@ -41,7 +42,7 @@ Mit `api_precheck.enabled: true` fragt das Tool vor jedem fetch per GitLab-API (
 beider Instanzen ab und ueberspringt das Repo komplett, wenn das alte GitLab nichts Neues hat
 (kein fetch, kein Checkout, kein `git-old`-Remote). Als "neu" gilt:
 
-- ein Branch (ausser `exclude_branches`) oder Tag, der im neuen GitLab fehlt, oder
+- ein Branch (ausser `exclude_branches`) oder Tag, der im neuen GitLab fehlt (bei `overwrite_tags` auch ein Tag mit anderem Ziel), oder
 - ein Branch-Head, der im neuen GitLab unbekannt oder nicht im gleichnamigen Branch enthalten ist.
 
 Tokens (Scope `read_api`) werden aus den Umgebungsvariablen `GITLAB_NEW_TOKEN` und

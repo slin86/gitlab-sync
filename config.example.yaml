@@ -21,6 +21,11 @@ exclude:
 # Branch-Namen, die in allen Repos nicht gesynct werden (fnmatch-Globs, z.B. "wip/*")
 exclude_branches: [dependabot*, renovate/*]
 
+# true: Tags, die in beiden GitLabs gleich heissen, aber auf unterschiedliche Commits zeigen,
+# werden im neuen GitLab mit dem Stand des alten ueberschrieben (Force-Push, alt -> neu).
+# false: nur Warnung im Protokoll. Geschuetzte Tags im Ziel koennen den Push ablehnen.
+overwrite_tags: true
+
 # Vorabpruefung per GitLab-API (v4): fragt Branches/Tags beider Instanzen ab und ueberspringt
 # das Repo komplett (kein fetch/checkout), wenn das alte GitLab nichts Neues hat.
 # Tokens (Scope read_api) kommen aus Umgebungsvariablen, nie aus dieser Datei.

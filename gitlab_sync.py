@@ -57,6 +57,7 @@ class Config:
     include: List[str] = field(default_factory=list)
     exclude: List[str] = field(default_factory=list)
     exclude_branches: List[str] = field(default_factory=list)
+    overwrite_tags: bool = False
     api_precheck: ApiPrecheck = field(default_factory=ApiPrecheck)
     log_file: Path = Path("gitlab-sync.log")
     dry_run: bool = False
@@ -85,6 +86,7 @@ def load_config(path: Path) -> Config:
         include=list(raw.get("include") or []),
         exclude=list(raw.get("exclude") or []),
         exclude_branches=list(raw.get("exclude_branches") or []),
+        overwrite_tags=bool(raw.get("overwrite_tags", False)),
         api_precheck=ApiPrecheck(**(raw.get("api_precheck") or {})),
         log_file=p(raw.get("log_file", "gitlab-sync.log")),
         dry_run=bool(raw.get("dry_run", False)),
@@ -122,6 +124,7 @@ class Stats:
     branches_current: int = 0
     repos_skipped: int = 0
     tags_pushed: int = 0
+    tags_overwritten: int = 0
     conflicts: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -276,9 +279,17 @@ def api_precheck(new_url: str, cfg: Config) -> bool:
         if not any(r["type"] == "branch" and r["name"] == name for r in refs):
             return True
 
+    def target(t: dict) -> str:
+        return t.get("target") or t["commit"]["id"]
+
     old_tags = _paged(cfg.old_host, old_token, f"{base}/tags", pc) or []
-    new_tags = {t["name"] for t in _paged(cfg.new_host, new_token, f"{base}/tags", pc) or []}
-    return any(t["name"] not in new_tags for t in old_tags)
+    new_tags = {t["name"]: target(t) for t in _paged(cfg.new_host, new_token, f"{base}/tags", pc) or []}
+    for t in old_tags:
+        if t["name"] not in new_tags:
+            return True
+        if cfg.overwrite_tags and new_tags[t["name"]] != target(t):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- discovery
@@ -352,7 +363,7 @@ def sync_repo(path: Path, cfg: Config, log: Log, d: int, stats: Stats,
 
         log.line(d + 1, f"Update {new} ({new_url})")
         git.run("fetch", new, "--prune")
-        git.run("fetch", new, "--tags")
+        git.run("fetch", new, "--tags", "--force")
 
         current = git.try_out("remote", "get-url", old)
         if current is None:
@@ -476,21 +487,30 @@ def _sync_tags(git: Git, cfg: Config, log: Log, d: int, stats: Stats, repo: Path
     git.run("fetch", old, "--no-tags", "--prune", f"+refs/tags/*:{TAG_NS}/*")
     try:
         lines = git.run("for-each-ref", "--format=%(refname) %(objectname)", f"{TAG_NS}/").splitlines()
-        to_push: Dict[str, str] = {}
+        to_push: Dict[str, str] = {}   # Tag -> Ziel-SHA (aus dem alten GitLab)
+        previous: Dict[str, Optional[str]] = {}  # Tag -> bisheriger lokaler/neuer Stand
         for ln in lines:
             ref, sha = ln.split()
             tag = ref[len(TAG_NS) + 1:]
             local = git.try_out("rev-parse", "--verify", "-q", f"refs/tags/{tag}")
-            if local is None:
-                to_push[tag] = sha
-            elif local != sha:
+            if local == sha:
+                continue
+            if local is not None and not cfg.overwrite_tags:
                 msg = f"Tag {tag} unterscheidet sich zwischen {old} und {new} - nicht ueberschrieben"
                 log.line(d, f"[WARN] {msg}")
                 stats.warnings.append(f"{repo}: {msg}")
+                continue
+            to_push[tag] = sha
+            previous[tag] = local
         if not to_push:
             log.line(d, "Tags: nichts zu syncen")
             return
-        log.line(d, f"Tags: {len(to_push)} neue Tags {old} -> {new}")
+        changed = sorted(t for t in to_push if previous[t] is not None)
+        created = sorted(t for t in to_push if previous[t] is None)
+        log.line(d, f"Tags: {len(created)} neue, {len(changed)} abweichende Tags {old} -> {new}")
+        for t in changed:
+            log.line(d + 1, f"Tag {t}: ueberschreibe {previous[t][:10]} -> {to_push[t][:10]}"
+                            + (" [DRY-RUN]" if cfg.dry_run else ""))
         if cfg.dry_run:
             log.line(d + 1, f"[DRY-RUN] Push von {len(to_push)} Tags uebersprungen: " + ", ".join(sorted(to_push)))
             return
@@ -500,13 +520,19 @@ def _sync_tags(git: Git, cfg: Config, log: Log, d: int, stats: Stats, repo: Path
         for i in range(0, len(tags), 200):
             chunk = tags[i:i + 200]
             try:
-                git.run("push", new, *[f"refs/tags/{t}:refs/tags/{t}" for t in chunk])
-                stats.tags_pushed += len(chunk)
+                # '+' erzwingt das Ueberschreiben abweichender Tags; neue Tags sind davon unberuehrt
+                git.run("push", new, *[f"+refs/tags/{t}:refs/tags/{t}" if previous[t] else
+                                       f"refs/tags/{t}:refs/tags/{t}" for t in chunk])
+                stats.tags_pushed += sum(1 for t in chunk if previous[t] is None)
+                stats.tags_overwritten += sum(1 for t in chunk if previous[t] is not None)
             except GitError as e:
-                for t in chunk:
-                    git.run("update-ref", "-d", f"refs/tags/{t}", check=False)
+                for t in chunk:  # lokalen Stand auf den Zustand vor dem Lauf zuruecksetzen
+                    if previous[t] is None:
+                        git.run("update-ref", "-d", f"refs/tags/{t}", check=False)
+                    else:
+                        git.run("update-ref", f"refs/tags/{t}", previous[t], check=False)
                 raise e
-        log.line(d + 1, f"Push von {len(tags)} Tags OK")
+        log.line(d + 1, f"Push von {len(tags)} Tags OK ({len(changed)} ueberschrieben)")
     finally:
         refs = git.run("for-each-ref", "--format=delete %(refname)", f"{TAG_NS}/", check=False)
         if refs:
@@ -560,7 +586,7 @@ def run(cfg: Config, only: List[str]) -> int:
                     f"{stats.repos_skipped} per API-Vorabpruefung uebersprungen)")
         log.line(0, f"Branches: {stats.branches_new} neu, {stats.branches_updated} aktualisiert, "
                     f"{stats.branches_current} aktuell; Commits gesynct: {stats.commits}; "
-                    f"Tags: {stats.tags_pushed}")
+                    f"Tags: {stats.tags_pushed} neu, {stats.tags_overwritten} ueberschrieben")
         for title, items in (("Konflikte", stats.conflicts), ("Fehler", stats.errors),
                              ("Warnungen", stats.warnings)):
             if items:

@@ -159,6 +159,41 @@ class SyncTests(unittest.TestCase):
             self.run_sync(False)
         self.assertIn("feature", self.heads(self.new).split())
 
+    def _move_old_tag(self):
+        t = Path(self.tmp.name)
+        w = t / "tagmove"
+        git(t, "clone", "-q", str(self.old), str(w))
+        commit(w, "t", "t", "tag target")
+        git(w, "tag", "-f", "v1")
+        git(w, "push", "-q", "--force", "origin", "v1")
+        return git(w, "rev-parse", "v1")
+
+    def test_diverging_tag_not_overwritten_by_default(self):
+        old_v1 = self._move_old_tag()
+        new_v1 = git(self.new, "rev-parse", "v1")
+        ok, stats = self.run_sync(False)
+        self.assertEqual(git(self.new, "rev-parse", "v1"), new_v1)
+        self.assertNotEqual(new_v1, old_v1)
+        self.assertTrue(any("v1" in w for w in stats.warnings))
+
+    def test_diverging_tag_overwritten(self):
+        old_v1 = self._move_old_tag()
+        self.cfg.overwrite_tags = True
+        ok, stats = self.run_sync(False)
+        self.assertEqual(git(self.new, "rev-parse", "v1"), old_v1)
+        self.assertEqual(stats.tags_overwritten, 1)
+        self.assertEqual(git(self.repo, "rev-parse", "v1"), old_v1)
+        # zweiter Lauf: nichts mehr zu ueberschreiben
+        ok, stats2 = self.run_sync(False)
+        self.assertEqual(stats2.tags_overwritten, 0)
+
+    def test_diverging_tag_dry_run(self):
+        self._move_old_tag()
+        new_v1 = git(self.new, "rev-parse", "v1")
+        self.cfg.overwrite_tags = True
+        self.run_sync(True)
+        self.assertEqual(git(self.new, "rev-parse", "v1"), new_v1)
+
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]
         self.assertEqual(gs.discover(self.cfg, []), [self.repo])
@@ -185,7 +220,9 @@ class ApiPrecheckTests(unittest.TestCase):
                 data = old_br if old else new_br
                 return 200, [{"name": n, "commit": {"id": s}} for n, s in data.items()], {}
             if path.endswith("/tags"):
-                return 200, [{"name": n} for n in (old_tags if old else new_tags)], {}
+                tags = old_tags if old else new_tags
+                items = tags.items() if isinstance(tags, dict) else ((n, n) for n in tags)
+                return 200, [{"name": n, "target": t} for n, t in items], {}
             sha = path.split("/commits/")[1].split("/")[0]
             if refs is None or sha not in refs:
                 return 404, None, {}
@@ -215,6 +252,13 @@ class ApiPrecheckTests(unittest.TestCase):
     def test_new_tag_in_old(self):
         self.assertTrue(self.run_check({"main": "a"}, {"main": "a"}, ["v1"], []))
         self.assertFalse(self.run_check({"main": "a"}, {"main": "a"}, ["v1"], ["v1"]))
+
+    def test_changed_tag_only_matters_with_overwrite(self):
+        args = ({"main": "a"}, {"main": "a"}, {"v1": "x"}, {"v1": "y"})
+        self.assertFalse(self.run_check(*args))
+        self.cfg.overwrite_tags = True
+        self.assertTrue(self.run_check(*args))
+        self.assertFalse(self.run_check({"main": "a"}, {"main": "a"}, {"v1": "x"}, {"v1": "x"}))
 
     def test_excluded_branch_ignored(self):
         self.cfg.exclude_branches = ["wip/*"]
