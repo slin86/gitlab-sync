@@ -36,6 +36,24 @@ Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeich
 Es wird nie ein Branch oder Tag gelöscht und kein Branch force-gepusht (Force-Push nur für abweichende Tags bei `overwrite_tags`). Branches, die nur im neuen GitLab
 existieren, bleiben unverändert. Ein lokaler Branch mit unveröffentlichten Commits wird übersprungen (Warnung).
 
+## Jenkins-Rollback (optional)
+
+Baut Jenkins im neuen GitLab bei Pushes auf `main` und erzeugt dabei eigene Commits/Tags, kann der Merge
+aus dem alten GitLab daran scheitern. Mit `jenkins_rollback.enabled: true` gilt bei einem **Merge-Konflikt**
+auf den Branches aus `jenkins_rollback.branches` (Default `main`):
+
+1. Die obersten Commits (First-Parent-Kette) von `main` im neuen GitLab werden einzeln zurückgedreht,
+   **solange ihr Committer Jenkins ist**. Maßgeblich ist der Committer, nicht der Autor; `committers` sind
+   fnmatch-Globs (Groß-/Kleinschreibung egal) auf Committer-Name oder -E-Mail, z.B. `["jenkins*"]`.
+2. Nach jedem Schritt wird der Merge erneut versucht. Klappt er, wird das Ergebnis mit
+   `git push --force-with-lease` (erwarteter Stand = der gerade geholte) nach `origin` geschrieben.
+3. Ist ein Commit darunter nicht von Jenkins, oder werden mehr als `max_commits` (Default 50) Commits
+   gebraucht, wird nichts zurückgedreht: normaler `[KONFLIKT]`, der Branch bleibt unverändert.
+
+Tags auf zurückgedrehten Commits werden nicht gelöscht (nur Hinweis im Protokoll). Jeder Rollback steht
+als Warnung in der Zusammenfassung, inklusive der verworfenen Commit-Hashes. Im Dry-Run wird der Rollback
+nur lokal durchgespielt und anschließend zurückgesetzt; es wird nichts gepusht.
+
 ## API-Vorabpruefung (optional)
 
 Mit `api_precheck.enabled: true` fragt das Tool vor jedem fetch per GitLab-API (v4) Branches und Tags

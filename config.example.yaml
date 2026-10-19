@@ -26,6 +26,18 @@ exclude_branches: [dependabot*, renovate/*]
 # false: nur Warnung im Protokoll. Geschuetzte Tags im Ziel koennen den Push ablehnen.
 overwrite_tags: true
 
+# Jenkins baut bei Pushes auf main im neuen GitLab und erzeugt dabei Commits/Tags, die den Merge
+# aus dem alten GitLab blockieren koennen. Bei einem Merge-Konflikt auf einem der Branches werden
+# die obersten Commits im neuen GitLab zurueckgedreht, solange ihr COMMITTER Jenkins ist, bis der
+# Merge klappt. Das Ergebnis wird mit Force-Push (--force-with-lease) nach origin geschrieben.
+# Ist ein Commit darunter nicht von Jenkins, wird nichts zurueckgedreht (normaler Konflikt).
+# Tags auf zurueckgedrehten Commits bleiben bestehen (nur Hinweis im Protokoll).
+jenkins_rollback:
+  enabled: true
+  committers: ["jenkins*"]   # fnmatch-Globs (ohne Gross-/Kleinschreibung) auf Committer-Name oder -E-Mail
+  branches: [main]
+  max_commits: 50            # Sicherheitslimit pro Branch
+
 # Vorabpruefung per GitLab-API (v4): fragt Branches/Tags beider Instanzen ab und ueberspringt
 # das Repo komplett (kein fetch/checkout), wenn das alte GitLab nichts Neues hat.
 # Tokens (Scope read_api) kommen aus Umgebungsvariablen, nie aus dieser Datei.
