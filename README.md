@@ -35,6 +35,19 @@ Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeich
 Es wird nie ein Branch oder Tag gelöscht und nie force-gepusht. Branches, die nur im neuen GitLab
 existieren, bleiben unverändert. Ein lokaler Branch mit unveröffentlichten Commits wird übersprungen (Warnung).
 
+## API-Vorabpruefung (optional)
+
+Mit `api_precheck.enabled: true` fragt das Tool vor jedem fetch per GitLab-API (v4) Branches und Tags
+beider Instanzen ab und ueberspringt das Repo komplett, wenn das alte GitLab nichts Neues hat
+(kein fetch, kein Checkout, kein `git-old`-Remote). Als "neu" gilt:
+
+- ein Branch (ausser `exclude_branches`) oder Tag, der im neuen GitLab fehlt, oder
+- ein Branch-Head, der im neuen GitLab unbekannt oder nicht im gleichnamigen Branch enthalten ist.
+
+Tokens (Scope `read_api`) werden aus den Umgebungsvariablen `GITLAB_NEW_TOKEN` und
+`GITLAB_OLD_TOKEN` gelesen (Namen in der Config aenderbar). Ist die Pruefung nicht moeglich
+(Token fehlt, Netzwerk-/API-Fehler, Projekt nicht gefunden), laeuft der volle Sync wie bisher.
+
 ## Protokoll
 
 Eingerückte Textdatei (`log_file`, wird angehängt) plus Konsole, am Ende eine Zusammenfassung mit

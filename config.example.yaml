@@ -21,6 +21,17 @@ exclude:
 # Branch-Namen, die in allen Repos nicht gesynct werden (fnmatch-Globs, z.B. "wip/*")
 exclude_branches: [dependabot*, renovate/*]
 
+# Vorabpruefung per GitLab-API (v4): fragt Branches/Tags beider Instanzen ab und ueberspringt
+# das Repo komplett (kein fetch/checkout), wenn das alte GitLab nichts Neues hat.
+# Tokens (Scope read_api) kommen aus Umgebungsvariablen, nie aus dieser Datei.
+# Schlaegt die Pruefung fehl (Token fehlt, Fehler, Projekt nicht gefunden), laeuft der volle Sync.
+api_precheck:
+  enabled: true
+  new_token_env: GITLAB_NEW_TOKEN
+  old_token_env: GITLAB_OLD_TOKEN
+  scheme: https
+  timeout: 15
+
 log_file: gitlab-sync.log
 
 # true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)

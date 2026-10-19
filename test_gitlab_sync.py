@@ -1,7 +1,9 @@
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gitlab_sync as gs
 
@@ -134,10 +136,94 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn("feature", self.heads(self.new).split())
         self.assertEqual(git(self.new, "rev-parse", "main"), git(self.old, "rev-parse", "main"))
 
+    def test_up_to_date_skips_repo_entirely(self):
+        self.cfg.api_precheck = gs.ApiPrecheck(enabled=True)
+        before = git(self.new, "for-each-ref")
+        with mock.patch.object(gs, "api_precheck", return_value=False):
+            ok, stats = self.run_sync(False)
+        self.assertTrue(ok)
+        self.assertEqual(stats.repos_skipped, 1)
+        self.assertEqual(before, git(self.new, "for-each-ref"))
+        self.assertNotIn("git-old", git(self.repo, "remote").split())
+
+    def test_api_error_falls_back_to_full_sync(self):
+        self.cfg.api_precheck = gs.ApiPrecheck(enabled=True)
+        with mock.patch.object(gs, "api_precheck", side_effect=gs.ApiError("boom")):
+            ok, stats = self.run_sync(False)
+        self.assertEqual(stats.repos_skipped, 0)
+        self.assertIn("feature", self.heads(self.new).split())
+
+    def test_has_news_runs_full_sync(self):
+        self.cfg.api_precheck = gs.ApiPrecheck(enabled=True)
+        with mock.patch.object(gs, "api_precheck", return_value=True):
+            self.run_sync(False)
+        self.assertIn("feature", self.heads(self.new).split())
+
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]
         self.assertEqual(gs.discover(self.cfg, []), [self.repo])
         self.assertEqual(gs.discover(self.cfg, ["nope"]), [])
+
+
+class ApiPrecheckTests(unittest.TestCase):
+    URL = "git@gitlab.example.com:grp/sub/repo.git"
+
+    def setUp(self):
+        self.cfg = gs.Config(root=Path("."), new_host="gitlab.example.com",
+                             old_host="git.example.com",
+                             api_precheck=gs.ApiPrecheck(enabled=True))
+        p = mock.patch.dict(os.environ, {"GITLAB_NEW_TOKEN": "n", "GITLAB_OLD_TOKEN": "o"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_check(self, old_br, new_br, old_tags=(), new_tags=(), refs=None):
+        """refs: sha -> Liste von Branch-Namen, die den Commit enthalten (None = unbekannt)."""
+        def fake(host, token, path, query, pc):
+            old = host == "git.example.com"
+            self.assertIn("grp%2Fsub%2Frepo", path)
+            if path.endswith("/branches"):
+                data = old_br if old else new_br
+                return 200, [{"name": n, "commit": {"id": s}} for n, s in data.items()], {}
+            if path.endswith("/tags"):
+                return 200, [{"name": n} for n in (old_tags if old else new_tags)], {}
+            sha = path.split("/commits/")[1].split("/")[0]
+            if refs is None or sha not in refs:
+                return 404, None, {}
+            return 200, [{"type": "branch", "name": n} for n in refs[sha]], {}
+        with mock.patch.object(gs, "_request", fake):
+            return gs.api_precheck(self.URL, self.cfg)
+
+    def test_project_path(self):
+        self.assertEqual(gs.project_path(self.URL), "grp/sub/repo")
+        self.assertEqual(gs.project_path("https://h/a/b.git"), "a/b")
+
+    def test_identical_heads(self):
+        self.assertFalse(self.run_check({"main": "a"}, {"main": "a", "other": "x"}))
+
+    def test_branch_missing_in_new(self):
+        self.assertTrue(self.run_check({"main": "a", "f": "b"}, {"main": "a"}))
+
+    def test_old_head_already_contained_in_new(self):
+        self.assertFalse(self.run_check({"main": "a"}, {"main": "b"}, refs={"a": ["main"]}))
+
+    def test_old_head_unknown_in_new(self):
+        self.assertTrue(self.run_check({"main": "a"}, {"main": "b"}))
+
+    def test_old_head_only_on_other_branch(self):
+        self.assertTrue(self.run_check({"main": "a"}, {"main": "b"}, refs={"a": ["other"]}))
+
+    def test_new_tag_in_old(self):
+        self.assertTrue(self.run_check({"main": "a"}, {"main": "a"}, ["v1"], []))
+        self.assertFalse(self.run_check({"main": "a"}, {"main": "a"}, ["v1"], ["v1"]))
+
+    def test_excluded_branch_ignored(self):
+        self.cfg.exclude_branches = ["wip/*"]
+        self.assertFalse(self.run_check({"main": "a", "wip/x": "b"}, {"main": "a"}))
+
+    def test_missing_token(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(gs.ApiError):
+                gs.api_precheck(self.URL, self.cfg)
 
 
 if __name__ == "__main__":

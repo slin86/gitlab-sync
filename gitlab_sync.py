@@ -21,13 +21,16 @@ import argparse
 import fnmatch
 import os
 import re
+import json
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 import yaml
 
@@ -35,6 +38,15 @@ TAG_NS = "refs/sync-legacy-tags"
 
 
 # --------------------------------------------------------------------------- config
+@dataclass
+class ApiPrecheck:
+    enabled: bool = False
+    new_token_env: str = "GITLAB_NEW_TOKEN"
+    old_token_env: str = "GITLAB_OLD_TOKEN"
+    scheme: str = "https"
+    timeout: int = 15
+
+
 @dataclass
 class Config:
     root: Path
@@ -45,6 +57,7 @@ class Config:
     include: List[str] = field(default_factory=list)
     exclude: List[str] = field(default_factory=list)
     exclude_branches: List[str] = field(default_factory=list)
+    api_precheck: ApiPrecheck = field(default_factory=ApiPrecheck)
     log_file: Path = Path("gitlab-sync.log")
     dry_run: bool = False
     restore_branch: bool = True
@@ -72,6 +85,7 @@ def load_config(path: Path) -> Config:
         include=list(raw.get("include") or []),
         exclude=list(raw.get("exclude") or []),
         exclude_branches=list(raw.get("exclude_branches") or []),
+        api_precheck=ApiPrecheck(**(raw.get("api_precheck") or {})),
         log_file=p(raw.get("log_file", "gitlab-sync.log")),
         dry_run=bool(raw.get("dry_run", False)),
         restore_branch=bool(raw.get("restore_branch", True)),
@@ -106,6 +120,7 @@ class Stats:
     branches_new: int = 0
     branches_updated: int = 0
     branches_current: int = 0
+    repos_skipped: int = 0
     tags_pushed: int = 0
     conflicts: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -177,6 +192,95 @@ def derive_old_url(new_url: str, cfg: Config) -> str:
     return f"{m['user'] or ''}{cfg.old_host}:{m['path']}"
 
 
+# --------------------------------------------------------------------------- api precheck
+class ApiError(Exception):
+    pass
+
+
+def project_path(url: str) -> str:
+    """Projektpfad (group/sub/repo) aus einer Git-URL."""
+    if "://" in url:
+        path = urlsplit(url).path
+    else:
+        m = _SCP.match(url)
+        if not m:
+            raise ValueError(f"URL nicht erkannt: {url}")
+        path = m["path"]
+    path = path.strip("/")
+    return path[:-4] if path.endswith(".git") else path
+
+
+def _request(host: str, token: str, path: str, query: Dict[str, object],
+             pc: ApiPrecheck):
+    """GET gegen die GitLab-API v4. Gibt (status, json, header) zurueck; 404 ist kein Fehler."""
+    url = f"{pc.scheme}://{host}/api/v4{path}?{urlencode(query)}"
+    req = Request(url, headers={"PRIVATE-TOKEN": token, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=pc.timeout) as resp:
+            return resp.status, json.load(resp), resp.headers
+    except HTTPError as e:
+        if e.code == 404:
+            return 404, None, e.headers
+        raise ApiError(f"{host}{path}: HTTP {e.code}")
+    except (URLError, OSError, ValueError) as e:
+        raise ApiError(f"{host}{path}: {e}")
+
+
+def _paged(host: str, token: str, path: str, pc: ApiPrecheck) -> Optional[list]:
+    """Alle Seiten einer Listen-Abfrage; None bei 404."""
+    out: list = []
+    page = 1
+    while page:
+        status, data, hdr = _request(host, token, path, {"per_page": 100, "page": page}, pc)
+        if status == 404:
+            return None
+        out.extend(data)
+        nxt = hdr.get("X-Next-Page") if hdr else ""
+        page = int(nxt) if nxt else 0
+    return out
+
+
+def api_precheck(new_url: str, cfg: Config) -> bool:
+    """Prueft per API, ob das alte GitLab Branches/Tags/Commits hat, die im neuen fehlen.
+
+    True = es gibt Neues (vollen Sync ausfuehren), False = nichts Neues.
+    Wirft ApiError, wenn die Pruefung nicht moeglich ist (dann voller Sync).
+    """
+    pc = cfg.api_precheck
+    new_token, old_token = os.environ.get(pc.new_token_env), os.environ.get(pc.old_token_env)
+    if not new_token or not old_token:
+        raise ApiError(f"Token fehlt (Umgebungsvariablen {pc.new_token_env} / {pc.old_token_env})")
+    proj = quote(project_path(new_url), safe="")
+    base = f"/projects/{proj}/repository"
+
+    old_br = _paged(cfg.old_host, old_token, f"{base}/branches", pc)
+    new_br = _paged(cfg.new_host, new_token, f"{base}/branches", pc)
+    if old_br is None:
+        raise ApiError(f"Projekt in {cfg.old_host} nicht gefunden")
+    if new_br is None:
+        raise ApiError(f"Projekt in {cfg.new_host} nicht gefunden")
+    new_heads = {b["name"]: b["commit"]["id"] for b in new_br}
+
+    for b in old_br:
+        name, sha = b["name"], b["commit"]["id"]
+        if any(fnmatch.fnmatchcase(name, pat) for pat in cfg.exclude_branches):
+            continue
+        if name not in new_heads:
+            return True
+        if new_heads[name] == sha:
+            continue
+        # Heads unterscheiden sich: ist der alte Head schon im neuen Branch enthalten?
+        refs = _paged(cfg.new_host, new_token, f"{base}/commits/{sha}/refs", pc)
+        if refs is None:
+            return True  # Commit im neuen GitLab unbekannt
+        if not any(r["type"] == "branch" and r["name"] == name for r in refs):
+            return True
+
+    old_tags = _paged(cfg.old_host, old_token, f"{base}/tags", pc) or []
+    new_tags = {t["name"] for t in _paged(cfg.new_host, new_token, f"{base}/tags", pc) or []}
+    return any(t["name"] not in new_tags for t in old_tags)
+
+
 # --------------------------------------------------------------------------- discovery
 def discover(cfg: Config, only: List[str]) -> List[Path]:
     repos: List[Path] = []
@@ -211,6 +315,7 @@ def sync_repo(path: Path, cfg: Config, log: Log, d: int, stats: Stats,
     created_local: List[str] = []
     orig_branch = git.try_out("symbolic-ref", "--short", "-q", "HEAD")
     orig_sha = git.try_out("rev-parse", "--verify", "-q", "HEAD")
+    skipped = False
 
     def err(depth: int, msg: str) -> None:
         log.line(depth, f"[FEHLER] {msg}")
@@ -226,6 +331,19 @@ def sync_repo(path: Path, cfg: Config, log: Log, d: int, stats: Stats,
         except ValueError as e:
             err(d + 1, f"{e} - Repo uebersprungen")
             return False
+
+        if cfg.api_precheck.enabled:
+            try:
+                has_news = api_precheck(new_url, cfg)
+            except (ApiError, ValueError) as e:
+                log.line(d + 1, f"[WARN] API-Vorabpruefung nicht moeglich ({e}) - voller Sync")
+                has_news = True
+            if not has_news:
+                log.line(d + 1, f"API-Vorabpruefung: nichts Neues in {cfg.old_host} - uebersprungen")
+                stats.repos_skipped += 1
+                skipped = True
+                return True
+            log.line(d + 1, f"API-Vorabpruefung: Aenderungen in {cfg.old_host} vorhanden")
 
         if git.run("status", "--porcelain", check=False):
             log.line(d + 1, "[WARN] lokale Aenderungen vorhanden - werden verworfen")
@@ -276,7 +394,8 @@ def sync_repo(path: Path, cfg: Config, log: Log, d: int, stats: Stats,
     except GitError as e:
         err(d + 1, str(e))
     finally:
-        _restore(git, cfg, orig_branch, orig_sha, created_local)
+        if not skipped:
+            _restore(git, cfg, orig_branch, orig_sha, created_local)
     return len(stats.errors) + len(stats.conflicts) == problems_before
 
 
@@ -437,7 +556,8 @@ def run(cfg: Config, only: List[str]) -> int:
             if sync_repo(repo, cfg, log, depth, stats):
                 stats.repos_ok += 1
         log.line(0, "=== Zusammenfassung ===")
-        log.line(0, f"Repos: {stats.repos} ({stats.repos_ok} ohne Probleme)")
+        log.line(0, f"Repos: {stats.repos} ({stats.repos_ok} ohne Probleme, "
+                    f"{stats.repos_skipped} per API-Vorabpruefung uebersprungen)")
         log.line(0, f"Branches: {stats.branches_new} neu, {stats.branches_updated} aktualisiert, "
                     f"{stats.branches_current} aktuell; Commits gesynct: {stats.commits}; "
                     f"Tags: {stats.tags_pushed}")
