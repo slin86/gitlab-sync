@@ -39,6 +39,12 @@ jenkins_rollback:
   max_commits: 50            # Sicherheitslimit pro Branch
   instructions_file: jenkins-rollback.md   # relativ zum Verzeichnis der log_file
 
+# Wird ein Push auf einen geschuetzten Branch abgelehnt ("You are not allowed to push code to protected
+# branches"), landet das Repo mit Link zur Seite "Protected branches" in dieser Datei (ohne Duplikate,
+# relativ zum Verzeichnis der log_file). Der Seitenpfad haengt von der GitLab-Version ab.
+protected_branches_file: protected_branches.md
+protected_branches_page: "/-/settings/repository#js-protected-branches-settings"
+
 # Vorabpruefung per GitLab-API (v4): fragt Branches/Tags beider Instanzen ab und ueberspringt
 # das Repo komplett (kein fetch/checkout), wenn das alte GitLab nichts Neues hat.
 # Tokens (Scope read_api) kommen aus Umgebungsvariablen, nie aus dieser Datei.
@@ -51,6 +57,10 @@ api_precheck:
   timeout: 15
 
 log_file: gitlab-sync.log
+
+# Branches, die nicht automatisch gemerged werden konnten (Merge-Konflikt), werden hier angehaengt
+# (eine Zeile pro Branch, ohne Duplikate bei gleichem Stand). Relativ zum Verzeichnis der log_file.
+conflicts_file: branch_konflikts.txt
 
 # true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)
 dry_run: false

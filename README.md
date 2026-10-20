@@ -82,7 +82,9 @@ Tokens (Scope `read_api`) werden aus den Umgebungsvariablen `GITLAB_NEW_TOKEN` u
 
 ## Protokoll
 
-Eingerückte Textdatei (`log_file`, wird angehängt) plus Konsole, am Ende eine Zusammenfassung mit
+Das Protokoll läuft über [loguru](https://github.com/Delgan/loguru): eingerückte Textdatei (`log_file`,
+wird angehängt, Format `Zeit | Level | Meldung`) plus Konsole (nur die eingerückte Meldung). Level:
+`[FEHLER]` → ERROR, `[WARN]`/`[KONFLIKT]` → WARNING, sonst INFO. Am Ende steht eine Zusammenfassung mit
 Konflikten, Fehlern und Warnungen:
 
     Synce Ordner /work/gitlab (12 Repos)
@@ -92,6 +94,23 @@ Konflikten, Fehlern und Warnungen:
                 -> Fuege git-old hinzu: git@git.example.com:team-a/repo-x.git
                 -> Checkout Branch main
                 -> Synce 123 Commits git-old -> origin (Fast-Forward)
+
+## Sammeldateien
+
+Alle liegen neben der `log_file` (Pfad jeweils in der Config änderbar), werden angehängt und enthalten
+keine Duplikate bei gleichem Stand. Sie entstehen auch im Dry-Run, soweit der Anlass ohne Push erkennbar ist.
+
+- **`branch_konflikts.txt`** (`conflicts_file`): Branches, die nicht gemerged werden konnten. Eine Zeile pro
+  Branch: `Zeit | Repo | Branch | git-old=<SHA> | origin=<SHA> | N Commits`, ggf. mit dem Zusatz
+  `Jenkins-Rollback-Anleitung`.
+- **`protected_branches.md`** (`protected_branches_file`): Repos, bei denen der Push mit
+  `GitLab: You are not allowed to push code to protected branches on this project.` abgelehnt wurde
+  (der Maintainer darf nicht in den Branch pushen). Eine Zeile pro Repo und Branch mit Link direkt zur
+  Seite „Protected branches“ (Settings → Repository) des Projekts im neuen GitLab. Dort beim Branch unter
+  „Allowed to push and merge“ die Rolle Maintainer erlauben und das Tool erneut laufen lassen. Der Seitenpfad
+  (`protected_branches_page`, Default `/-/settings/repository#js-protected-branches-settings`) kann je nach
+  GitLab-Version abweichen. Im Dry-Run gibt es keinen Push und damit keine Einträge.
+- **`jenkins-rollback.md`**: siehe oben.
 
 ## Tests
 

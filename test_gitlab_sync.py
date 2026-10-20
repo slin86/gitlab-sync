@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from loguru import logger
+
 import gitlab_sync as gs
+
+logger.remove()  # keine Standardausgabe nach stderr in den Tests
 
 
 def git(cwd, *args):
@@ -304,6 +308,117 @@ class SyncTests(unittest.TestCase):
         self.cfg.jenkins_rollback = gs.JenkinsRollback(enabled=True, committers=["JENKINS@t"])
         ok, stats = self.run_sync(False)
         self.assertEqual(len(stats.rollbacks), 1)
+
+    def test_conflicts_file_lists_unmergeable_branches_without_duplicates(self):
+        ok, stats = self.run_sync(False)  # 'diverge' konfligiert
+        self.assertEqual([c.branch for c in stats.branch_conflicts], ["diverge"])
+        path = gs.append_branch_conflicts(self.cfg, stats.branch_conflicts)
+        self.assertEqual(path.name, "branch_konflikts.txt")
+        lines = path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn(" | grp/repo | diverge | git-old=", lines[0])
+        self.assertIn(" | 1 Commits", lines[0])
+        # gleicher Stand beim naechsten Lauf: keine zweite Zeile
+        ok, stats2 = self.run_sync(False)
+        gs.append_branch_conflicts(self.cfg, stats2.branch_conflicts)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+
+    def test_conflicts_file_gets_new_line_when_state_changes(self):
+        ok, stats = self.run_sync(False)
+        path = gs.append_branch_conflicts(self.cfg, stats.branch_conflicts)
+        t = Path(self.tmp.name)
+        w = t / "oldmore"
+        git(t, "clone", "-q", str(self.old), str(w))
+        git(w, "checkout", "-q", "diverge")
+        commit(w, "a", "even-more-old", "old again")
+        git(w, "push", "-q", "origin", "diverge")
+        ok, stats2 = self.run_sync(False)
+        gs.append_branch_conflicts(self.cfg, stats2.branch_conflicts)
+        self.assertEqual(len(path.read_text().splitlines()), 2)
+
+    def test_conflicts_file_marks_jenkins_rollback(self):
+        self._push_new_main(("a", "jenkins1", "jenkins"))
+        self._enable_rollback()
+        ok, stats = self.run_sync(False)
+        path = gs.append_branch_conflicts(self.cfg, stats.branch_conflicts)
+        main_line = [ln for ln in path.read_text().splitlines() if " | main | " in ln][0]
+        self.assertTrue(main_line.endswith("Jenkins-Rollback-Anleitung"))
+        diverge_line = [ln for ln in path.read_text().splitlines() if " | diverge | " in ln][0]
+        self.assertNotIn("Jenkins", diverge_line)
+
+    def test_no_conflicts_no_file(self):
+        self.assertIsNone(gs.append_branch_conflicts(self.cfg, []))
+
+    def test_log_levels_and_file_format(self):
+        log = gs.Log(self.log, console=False)
+        log.line(1, "[FEHLER] boom")
+        log.line(2, "[WARN] hmm")
+        log.line(0, "ok <tag> {braces}")
+        log.close()
+        text = self.log.read_text().splitlines()[-3:]
+        self.assertRegex(text[0], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ERROR   \|     -> \[FEHLER\] boom$")
+        self.assertIn("| WARNING | ", text[1])
+        self.assertTrue(text[2].endswith("| INFO    | ok <tag> {braces}"))
+
+    # --- geschuetzte Branches ----------------------------------------------------------
+    def _reject_pushes(self, message):
+        hook = self.new / "hooks" / "pre-receive"
+        hook.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit 1\n")
+        hook.chmod(0o755)
+
+    PROTECTED = "GitLab: You are not allowed to push code to protected branches on this project."
+
+    def test_protected_branch_push_is_recorded(self):
+        self._reject_pushes(self.PROTECTED)
+        ok, stats = self.run_sync(False)
+        self.assertFalse(ok)
+        self.assertTrue(stats.protected_pushes)
+        self.assertTrue(all(p.repo == self.repo for p in stats.protected_pushes))
+        self.assertIn("feature", {p.branch for p in stats.protected_pushes})
+        self.assertTrue(stats.errors)  # bleibt zusaetzlich ein Fehler
+
+    def test_other_push_errors_are_not_recorded_as_protected(self):
+        self._reject_pushes("some other failure")
+        ok, stats = self.run_sync(False)
+        self.assertTrue(stats.errors)
+        self.assertEqual(stats.protected_pushes, [])
+
+    def test_dry_run_has_no_push_so_nothing_protected(self):
+        self._reject_pushes(self.PROTECTED)
+        ok, stats = self.run_sync(True)
+        self.assertEqual(stats.protected_pushes, [])
+
+    def test_protected_branches_url_and_file(self):
+        cfg = gs.Config(root=self.root, new_host="gitlab.example.com", old_host="git.example.com",
+                        log_file=self.log)
+        self.assertEqual(
+            gs.protected_branches_url(cfg, "git@gitlab.example.com:grp/sub/repo.git"),
+            "https://gitlab.example.com/grp/sub/repo/-/settings/repository#js-protected-branches-settings")
+        self.assertEqual(
+            gs.protected_branches_url(cfg, "https://gitlab.example.com/grp/sub/repo.git"),
+            "https://gitlab.example.com/grp/sub/repo/-/settings/repository#js-protected-branches-settings")
+        items = [gs.ProtectedPush(self.repo, "main", "git@gitlab.example.com:grp/repo.git"),
+                 gs.ProtectedPush(self.repo, "release", "git@gitlab.example.com:grp/repo.git")]
+        path = gs.append_protected_branches(cfg, items)
+        text = path.read_text()
+        self.assertIn("- [grp/repo](https://gitlab.example.com/grp/repo/-/settings/repository"
+                      "#js-protected-branches-settings) - Branch main", text)
+        self.assertIn(" - Branch release", text)
+        # zweiter Lauf: keine Duplikate, Kopf nur einmal
+        gs.append_protected_branches(cfg, items)
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(text.count("# Repos mit geschuetztem Branch"), 1)
+        # neuer Branch: nur eine Zeile kommt dazu
+        gs.append_protected_branches(cfg, items + [gs.ProtectedPush(self.repo, "dev",
+                                                  "git@gitlab.example.com:grp/repo.git")])
+        self.assertEqual(len(path.read_text().splitlines()), len(text.splitlines()) + 1)
+
+    def test_protected_branches_file_unparsable_url_falls_back_to_remote_url(self):
+        path = gs.append_protected_branches(self.cfg, [gs.ProtectedPush(self.repo, "main", str(self.new))])
+        self.assertIn(f"]({self.new})", path.read_text())
+
+    def test_no_protected_no_file(self):
+        self.assertIsNone(gs.append_protected_branches(self.cfg, []))
 
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]

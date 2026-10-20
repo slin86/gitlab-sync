@@ -34,8 +34,10 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import yaml
+from loguru import logger
 
 TAG_NS = "refs/sync-legacy-tags"
+PROTECTED_MSG = "not allowed to push code to protected branches"
 
 
 # --------------------------------------------------------------------------- config
@@ -71,6 +73,9 @@ class Config:
     api_precheck: ApiPrecheck = field(default_factory=ApiPrecheck)
     jenkins_rollback: JenkinsRollback = field(default_factory=JenkinsRollback)
     log_file: Path = Path("gitlab-sync.log")
+    conflicts_file: str = "branch_konflikts.txt"
+    protected_branches_file: str = "protected_branches.md"
+    protected_branches_page: str = "/-/settings/repository#js-protected-branches-settings"
     dry_run: bool = False
     restore_branch: bool = True
     git_timeout: int = 600
@@ -101,6 +106,10 @@ def load_config(path: Path) -> Config:
         api_precheck=ApiPrecheck(**(raw.get("api_precheck") or {})),
         jenkins_rollback=JenkinsRollback(**(raw.get("jenkins_rollback") or {})),
         log_file=p(raw.get("log_file", "gitlab-sync.log")),
+        conflicts_file=str(raw.get("conflicts_file", "branch_konflikts.txt")),
+        protected_branches_file=str(raw.get("protected_branches_file", "protected_branches.md")),
+        protected_branches_page=str(raw.get("protected_branches_page",
+                                            "/-/settings/repository#js-protected-branches-settings")),
         dry_run=bool(raw.get("dry_run", False)),
         restore_branch=bool(raw.get("restore_branch", True)),
         git_timeout=int(raw.get("git_timeout", 600)),
@@ -109,21 +118,34 @@ def load_config(path: Path) -> Config:
 
 # --------------------------------------------------------------------------- logging
 class Log:
-    def __init__(self, path: Path):
+    """Eingerueckte Protokollzeilen ueber loguru (Datei + Konsole).
+
+    Der Level ergibt sich aus dem Praefix der Zeile: [FEHLER] -> ERROR, [WARN]/[KONFLIKT] -> WARNING,
+    sonst INFO. Die Datei enthaelt Zeitstempel und Level, die Konsole nur die eingerueckte Meldung.
+    """
+    FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
+
+    def __init__(self, path: Path, console: bool = True):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(path, "a", encoding="utf-8")
+        self._ids = [logger.add(path, format=self.FILE_FORMAT, colorize=False, encoding="utf-8")]
+        if console:
+            self._ids.append(logger.add(sys.stdout, format="{message}", colorize=False))
 
     def line(self, depth: int, text: str) -> None:
         indent = "    " * depth + ("-> " if depth else "")
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if text.startswith("[FEHLER]"):
+            level = "ERROR"
+        elif text.startswith(("[WARN]", "[KONFLIKT]")):
+            level = "WARNING"
+        else:
+            level = "INFO"
         for part in text.splitlines() or [""]:
-            msg = f"{indent}{part}"
-            self._fh.write(f"{stamp} | {msg}\n")
-            print(msg, flush=True)
-        self._fh.flush()
+            logger.log(level, f"{indent}{part}")
 
     def close(self) -> None:
-        self._fh.close()
+        for i in self._ids:
+            logger.remove(i)
+        self._ids = []
 
 
 @dataclass
@@ -139,6 +161,25 @@ class RollbackItem:
 
 
 @dataclass
+class BranchConflict:
+    """Branch, der nicht automatisch gemerged werden konnte."""
+    repo: Path
+    branch: str
+    old_sha: str
+    new_sha: str
+    commits: int             # Commits aus dem alten GitLab, die im neuen fehlen
+    jenkins: bool            # Jenkins-Rollback-Anleitung wurde erzeugt
+
+
+@dataclass
+class ProtectedPush:
+    """Push auf einen geschuetzten Branch im neuen GitLab wurde abgelehnt."""
+    repo: Path
+    branch: str
+    new_url: str
+
+
+@dataclass
 class Stats:
     repos: int = 0
     repos_ok: int = 0
@@ -150,6 +191,8 @@ class Stats:
     tags_pushed: int = 0
     tags_overwritten: int = 0
     rollbacks: List["RollbackItem"] = field(default_factory=list)
+    branch_conflicts: List["BranchConflict"] = field(default_factory=list)
+    protected_pushes: List["ProtectedPush"] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -454,6 +497,10 @@ def _sync_branch(git: Git, cfg: Config, log: Log, d: int, stats: Stats, b: str,
         except GitError as e:
             log.line(d + 2, f"[FEHLER] Push {b}: {e}")
             stats.errors.append(f"{repo}: Push {b}: {e}")
+            if PROTECTED_MSG in str(e):
+                stats.protected_pushes.append(ProtectedPush(repo, b, git.run("remote", "get-url", new)))
+                log.line(d + 2, "Hinweis: Branch ist im neuen GitLab geschuetzt - Link steht in "
+                                f"{cfg.protected_branches_file}")
             return False
 
     if new_sha is None:
@@ -496,6 +543,7 @@ def _sync_branch(git: Git, cfg: Config, log: Log, d: int, stats: Stats, b: str,
             git.run("checkout", "-f", "-B", b, new_ref)
             found = _find_jenkins_rollback(git, cfg, log, d, b, new_ref, old_ref)
             git.run("checkout", "-f", "-B", b, new_ref)  # nichts am Branch aendern
+            stats.branch_conflicts.append(BranchConflict(repo, b, old_sha, new_sha, n, bool(found)))
             msg = f"Branch {b}: KONFLIKT beim Merge von {old}/{b} ({n} Commits) - uebersprungen"
             if found:
                 dropped, target, tags = found
@@ -714,6 +762,85 @@ def write_instructions(cfg: Config, items: List[RollbackItem]) -> Optional[Path]
     return path
 
 
+def append_branch_conflicts(cfg: Config, items: List[BranchConflict]) -> Optional[Path]:
+    """Haengt Branches, die nicht gemerged werden konnten, an die Konfliktdatei an.
+
+    Eine Zeile pro Branch. Ein Eintrag mit gleichem Repo, Branch und gleichen Staenden steht schon
+    in der Datei, wenn derselbe Konflikt bei einem frueheren Lauf erfasst wurde; er wird nicht doppelt
+    angehaengt. Gibt den Pfad zurueck, None wenn es nichts zu schreiben gab.
+    """
+    if not items:
+        return None
+    path = Path(cfg.conflicts_file)
+    if not path.is_absolute():
+        path = cfg.log_file.parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    known = set()
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            known.add(ln.partition(" | ")[2])
+    new_lines = []
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for it in items:
+        rel = it.repo.relative_to(cfg.root).as_posix() if cfg.root in it.repo.parents else str(it.repo)
+        entry = (f"{rel} | {it.branch} | {cfg.old_remote}={it.old_sha[:10]} | "
+                 f"{cfg.new_remote}={it.new_sha[:10]} | {it.commits} Commits"
+                 + (" | Jenkins-Rollback-Anleitung" if it.jenkins else ""))
+        if entry not in known:
+            known.add(entry)
+            new_lines.append(f"{stamp} | {entry}")
+    if new_lines:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(new_lines) + "\n")
+    return path
+
+
+def protected_branches_url(cfg: Config, new_url: str) -> str:
+    """Link zur Seite 'Geschuetzte Branches' (Settings > Repository) des Projekts im neuen GitLab."""
+    return (f"{cfg.api_precheck.scheme}://{cfg.new_host}/{project_path(new_url)}"
+            f"{cfg.protected_branches_page}")
+
+
+def append_protected_branches(cfg: Config, items: List[ProtectedPush]) -> Optional[Path]:
+    """Haengt Repos, in die nicht auf einen geschuetzten Branch gepusht werden durfte, als Linkliste an.
+
+    Eine Zeile pro Repo und Branch (`- [pfad](link) - Branch main`), ohne Duplikate bei erneutem Lauf.
+    Der Link fuehrt direkt zu den geschuetzten Branches; dort muss die Rolle Maintainer unter
+    'Allowed to push and merge' eingetragen werden. Gibt den Pfad zurueck, None wenn nichts zu schreiben war.
+    """
+    if not items:
+        return None
+    path = Path(cfg.protected_branches_file)
+    if not path.is_absolute():
+        path = cfg.log_file.parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    known = set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+    lines = []
+    if not known:
+        lines += [
+            "# Repos mit geschuetztem Branch im neuen GitLab",
+            "",
+            "Push abgelehnt (\"You are not allowed to push code to protected branches\"). Link oeffnen, unter",
+            "\"Protected branches\" beim Branch in \"Allowed to push and merge\" die Rolle Maintainer erlauben,",
+            "danach gitlab-sync erneut laufen lassen. Erledigte Zeilen koennen geloescht werden.",
+            "",
+        ]
+    for it in items:
+        rel = it.repo.relative_to(cfg.root).as_posix() if cfg.root in it.repo.parents else str(it.repo)
+        try:
+            link = protected_branches_url(cfg, it.new_url)
+        except ValueError:
+            link = it.new_url  # kein URL-Format erkannt: Remote-URL unveraendert angeben
+        line = f"- [{rel}]({link}) - Branch {it.branch}"
+        if line not in known:
+            known.add(line)
+            lines.append(line)
+    if lines:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    return path
+
+
 # --------------------------------------------------------------------------- main
 def run(cfg: Config, only: List[str]) -> int:
     log = Log(cfg.log_file)
@@ -748,6 +875,13 @@ def run(cfg: Config, only: List[str]) -> int:
         log.line(0, f"Branches: {stats.branches_new} neu, {stats.branches_updated} aktualisiert, "
                     f"{stats.branches_current} aktuell; Commits gesynct: {stats.commits}; "
                     f"Tags: {stats.tags_pushed} neu, {stats.tags_overwritten} ueberschrieben")
+        conflicts_path = append_branch_conflicts(cfg, stats.branch_conflicts)
+        if conflicts_path:
+            log.line(0, f"Branch-Konflikte: {len(stats.branch_conflicts)} Branch(es) in {conflicts_path}")
+        protected_path = append_protected_branches(cfg, stats.protected_pushes)
+        if protected_path:
+            log.line(0, f"Geschuetzte Branches: {len(stats.protected_pushes)} Push(es) abgelehnt, "
+                        f"Links in {protected_path}")
         written = write_instructions(cfg, stats.rollbacks)
         if written:
             log.line(0, f"Jenkins-Rollback: Anleitung fuer {len(stats.rollbacks)} Branch(es) in {written}")
@@ -770,6 +904,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--only", action="append", default=[], metavar="GLOB",
                     help="nur Repos, deren relativer Pfad passt (mehrfach moeglich)")
     args = ap.parse_args(argv)
+    logger.remove()  # loguru-Standardhandler (stderr) entfernen; Log richtet Datei und Konsole ein
     cfg = load_config(args.config)
     if args.dry_run:
         cfg.dry_run = True
