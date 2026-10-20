@@ -19,6 +19,13 @@ das Tool setzt `GIT_TERMINAL_PROMPT=0`, hängt also nie an einer Passwortabfrage
 
 Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeichnis fehlt.
 
+## Ablaufdiagramm
+
+Gesamtablauf und Ablauf pro Branch als Flussdiagramm: [docs/ablauf.md](docs/ablauf.md) (Mermaid, wird in
+GitLab/GitHub direkt gerendert; als Bild: [Gesamtablauf](docs/ablauf-gesamt.png),
+[pro Branch](docs/ablauf-branch.png)). Wer die Diagramme in `docs/ablauf.md` ändert, muss die Bilder neu
+rendern (z.B. mit `mmdc` aus `@mermaid-js/mermaid-cli`).
+
 ## Ablauf pro Repo
 
 1. lokale Änderungen verwerfen (`reset --hard`, `clean -fd`), `fetch` von `origin`
@@ -84,7 +91,9 @@ Tokens (Scope `read_api`) werden aus den Umgebungsvariablen `GITLAB_NEW_TOKEN` u
 
 Das Protokoll läuft über [loguru](https://github.com/Delgan/loguru): eingerückte Textdatei (`log_file`,
 wird angehängt, Format `Zeit | Level | Meldung`) plus Konsole (nur die eingerückte Meldung). Level:
-`[FEHLER]` → ERROR, `[WARN]`/`[KONFLIKT]` → WARNING, sonst INFO. Am Ende steht eine Zusammenfassung mit
+`[FEHLER]` → ERROR, `[WARN]`/`[KONFLIKT]` → WARNING, sonst INFO. Auf der Konsole sind Fehler rot und
+Warnungen/Konflikte gelb; Farben gibt es nur im Terminal (nicht bei Pipe oder Umleitung), `NO_COLOR=1`
+schaltet sie ab, `FORCE_COLOR=1` erzwingt sie. Die Logdatei enthält nie Farbcodes. Am Ende steht eine Zusammenfassung mit
 Konflikten, Fehlern und Warnungen:
 
     Synce Ordner /work/gitlab (12 Repos)
@@ -94,6 +103,23 @@ Konflikten, Fehlern und Warnungen:
                 -> Fuege git-old hinzu: git@git.example.com:team-a/repo-x.git
                 -> Checkout Branch main
                 -> Synce 123 Commits git-old -> origin (Fast-Forward)
+
+## Performance-Tracking
+
+Jeder git-Befehl und jeder API-Request wird gemessen (Kategorie, Dauer, Repo; nie Argumente oder URLs, da
+diese Zugangsdaten enthalten können). Kategorien: `git fetch origin`, `git fetch git-old`, `git push origin`,
+`git merge` usw. sowie `api <host> branches|tags|commit-refs`. So sieht man, ob das alte oder das neue GitLab
+bzw. die API bremst.
+
+- **Pro Repo** im Protokoll: `Dauer 12.3s (Netzwerk 11.8s)`.
+- **Am Ende des Laufs** eine Auswertung: Gesamtdauer und Netzwerkanteil, Zeit pro Befehlsart (Anzahl, Summe,
+  Schnitt, Maximum), die `perf_top` langsamsten Repos mit Aufschlüsselung (fetch neu/alt, push, API) und alle
+  Einzelbefehle ab `slow_command_seconds` (Default 30).
+- Einzelbefehle ab dieser Schwelle werden sofort als `[WARN] Langsamer Befehl: git fetch git-old 42.1s (team-a/repo-x)`
+  gemeldet, damit man beim laufenden Sync sieht, wo es hakt. `0` schaltet das ab.
+- **`performance.csv`** (`perf_file`, leer = aus): eine Zeile pro Repo und Lauf, angehängt, Spalten
+  `run_start, repo, status (ok|problem|skipped-api), total_s, network_s, fetch_new_s, fetch_old_s, push_s,
+  api_s, git_other_s`. Gut für Excel oder zum Vergleich mehrerer Läufe (z.B. mit und ohne `api_precheck`).
 
 ## Sammeldateien
 

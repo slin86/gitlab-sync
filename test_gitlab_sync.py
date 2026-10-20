@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import subprocess
 import tempfile
@@ -420,10 +422,144 @@ class SyncTests(unittest.TestCase):
     def test_no_protected_no_file(self):
         self.assertIsNone(gs.append_protected_branches(self.cfg, []))
 
+    # --- Performance-Tracking ----------------------------------------------------------
+    def test_full_run_writes_perf_report_and_csv(self):
+        self.cfg.slow_command_seconds = 0
+        with mock.patch.object(gs, "derive_old_url", return_value=str(self.old)):
+            code = gs.run(self.cfg, [])
+        self.assertEqual(code, 1)  # 'diverge' konfligiert
+        log = self.log.read_text()
+        self.assertIn("=== Performance ===", log)
+        self.assertIn("Zeit pro Befehlsart", log)
+        self.assertIn("git fetch origin", log)
+        self.assertIn("git fetch git-old", log)
+        self.assertIn("git push origin", log)
+        self.assertIn("Langsamste Repos (Top 1)", log)
+        self.assertIn("grp/repo: ", log)
+        self.assertRegex(log, r"-> Dauer [\d.]+s \(Netzwerk [\d.]+s\)")
+        csv_path = self.log.parent / "performance.csv"
+        rows = csv_path.read_text().splitlines()
+        self.assertEqual(rows[0], "run_start,repo,status,total_s,network_s,fetch_new_s,fetch_old_s,"
+                                  "push_s,api_s,git_other_s")
+        self.assertEqual(len(rows), 2)
+        self.assertIn(",grp/repo,problem,", rows[1])
+        # zweiter Lauf haengt an, Header nur einmal
+        with mock.patch.object(gs, "derive_old_url", return_value=str(self.old)):
+            gs.run(self.cfg, [])
+        self.assertEqual(len(csv_path.read_text().splitlines()), 3)
+
+    def test_perf_csv_can_be_disabled(self):
+        self.cfg.perf_file = ""
+        with mock.patch.object(gs, "derive_old_url", return_value=str(self.old)):
+            gs.run(self.cfg, [])
+        self.assertFalse((self.log.parent / "performance.csv").exists())
+
+    def _console_output(self, colorize):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            log = gs.Log(self.log, console=True, colorize=colorize)
+            log.line(1, "[FEHLER] boom <b> {x}")
+            log.line(2, "[WARN] hmm")
+            log.line(2, "[KONFLIKT] merge")
+            log.line(0, "alles gut <tag>")
+            log.close()
+        return buf.getvalue()
+
+    def test_console_is_colored_by_level(self):
+        out = self._console_output(True)
+        lines = out.splitlines()
+        self.assertIn("\x1b[31m", lines[0])           # ERROR rot
+        self.assertIn("[FEHLER] boom <b> {x}", lines[0])
+        self.assertIn("\x1b[33m", lines[1])           # WARNING gelb
+        self.assertIn("\x1b[33m", lines[2])
+        self.assertNotIn("\x1b[", lines[3])           # INFO ohne Farbe
+        self.assertEqual(lines[3], "alles gut <tag>")
+
+    def test_console_without_color_is_plain_message_only(self):
+        out = self._console_output(False)
+        self.assertNotIn("\x1b[", out)
+        self.assertEqual(out.splitlines()[0], "    -> [FEHLER] boom <b> {x}")
+        self.assertNotIn("ERROR", out)  # kein Level/Zeitstempel auf der Konsole
+
+    def test_console_auto_detect_has_no_color_when_not_a_tty(self):
+        self.assertNotIn("\x1b[", self._console_output(None))  # StringIO ist kein Terminal
+
+    def test_no_color_and_force_color_env(self):
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertNotIn("\x1b[", self._console_output(None))
+        with mock.patch.dict(os.environ, {"FORCE_COLOR": "1"}):
+            self.assertIn("\x1b[31m", self._console_output(None))
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):  # explizites Argument gewinnt
+            self.assertIn("\x1b[31m", self._console_output(True))
+
+    def test_file_never_contains_color_codes(self):
+        self._console_output(True)
+        self.assertNotIn("\x1b[", self.log.read_text())
+
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]
         self.assertEqual(gs.discover(self.cfg, []), [self.repo])
         self.assertEqual(gs.discover(self.cfg, ["nope"]), [])
+
+
+class PerfTests(unittest.TestCase):
+    def test_categories(self):
+        self.assertEqual(gs._git_category(("fetch", "origin", "--prune")), "git fetch origin")
+        self.assertEqual(gs._git_category(("fetch", "--no-tags", "git-old", "+refs/tags/*:x")), "git fetch git-old")
+        self.assertEqual(gs._git_category(("push", "-u", "origin", "refs/heads/m")), "git push origin")
+        self.assertEqual(gs._git_category(("merge", "--no-edit", "x")), "git merge")
+        self.assertEqual(gs._git_category(("rev-parse", "HEAD")), "git rev-parse")
+
+    def test_fmt_secs(self):
+        self.assertEqual(gs.fmt_secs(1.234), "1.2s")
+        self.assertEqual(gs.fmt_secs(75), "1m15s")
+        self.assertEqual(gs.fmt_secs(3725), "1h02m")
+
+    def test_record_aggregates_per_category_and_repo(self):
+        p = gs.Perf()
+        p.reset(slow=5)
+        p.repo = "a/b"
+        p.record("git fetch origin", 2.0)
+        p.record("git fetch origin", 4.0)
+        p.record("git merge", 1.0)
+        p.repo = None
+        p.record("git fetch origin", 1.0)
+        self.assertEqual(p.cat["git fetch origin"], [3, 7.0, 4.0])
+        self.assertEqual(p.repos["a/b"]["git fetch origin"], [2, 6.0, 4.0])
+        self.assertEqual(p.network_secs(p.repos["a/b"]), 6.0)
+        self.assertEqual(p.slow_calls, [])
+        p.record("api h branches", 6.5)
+        self.assertEqual(p.slow_calls, [(6.5, "api h branches", None)])
+
+    def test_slow_threshold_zero_disables_warning(self):
+        p = gs.Perf()
+        p.reset(slow=0)
+        p.record("git fetch origin", 999)
+        self.assertEqual(p.slow_calls, [])
+
+    def test_timed_records_even_on_error(self):
+        p = gs.Perf()
+        p.reset()
+        with self.assertRaises(RuntimeError):
+            with p.timed("git push origin"):
+                raise RuntimeError("x")
+        self.assertEqual(p.cat["git push origin"][0], 1)
+
+    def test_git_commands_and_api_requests_are_measured(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        git(t.name, "init", "-q")
+        gs.PERF.reset()
+        g = gs.Git(Path(t.name), 30)
+        g.run("status")
+        g.ok("rev-parse", "--git-dir")
+        self.assertEqual(gs.PERF.cat["git status"][0], 1)
+        self.assertEqual(gs.PERF.cat["git rev-parse"][0], 1)
+        # API: Request-Fehler (nicht erreichbar) wird trotzdem gezaehlt
+        with mock.patch.object(gs, "urlopen", side_effect=OSError("down")):
+            with self.assertRaises(gs.ApiError):
+                gs._request("h.example", "tok", "/projects/x/repository/tags", {}, gs.ApiPrecheck())
+        self.assertEqual(gs.PERF.cat["api h.example tags"][0], 1)
 
 
 class ApiPrecheckTests(unittest.TestCase):

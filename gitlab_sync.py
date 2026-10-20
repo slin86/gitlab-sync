@@ -18,6 +18,7 @@ Siehe README.md und config.example.yaml.
 from __future__ import annotations
 
 import argparse
+import csv
 import fnmatch
 import os
 import re
@@ -25,6 +26,8 @@ import json
 import shlex
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +79,9 @@ class Config:
     conflicts_file: str = "branch_konflikts.txt"
     protected_branches_file: str = "protected_branches.md"
     protected_branches_page: str = "/-/settings/repository#js-protected-branches-settings"
+    perf_file: str = "performance.csv"        # leer = keine CSV
+    perf_top: int = 10                          # Anzahl langsamste Repos in der Auswertung
+    slow_command_seconds: float = 30.0          # Einzelbefehle ab dieser Dauer werden gemeldet (0 = aus)
     dry_run: bool = False
     restore_branch: bool = True
     git_timeout: int = 600
@@ -110,6 +116,9 @@ def load_config(path: Path) -> Config:
         protected_branches_file=str(raw.get("protected_branches_file", "protected_branches.md")),
         protected_branches_page=str(raw.get("protected_branches_page",
                                             "/-/settings/repository#js-protected-branches-settings")),
+        perf_file=str(raw.get("perf_file", "performance.csv") or ""),
+        perf_top=int(raw.get("perf_top", 10)),
+        slow_command_seconds=float(raw.get("slow_command_seconds", 30)),
         dry_run=bool(raw.get("dry_run", False)),
         restore_branch=bool(raw.get("restore_branch", True)),
         git_timeout=int(raw.get("git_timeout", 600)),
@@ -117,19 +126,32 @@ def load_config(path: Path) -> Config:
 
 
 # --------------------------------------------------------------------------- logging
+def _console_format(record) -> str:
+    """Konsole: nur die eingerueckte Meldung, Fehler rot, Warnungen/Konflikte gelb."""
+    color = {"ERROR": "red", "CRITICAL": "red", "WARNING": "yellow"}.get(record["level"].name)
+    return (f"<{color}>{{message}}</{color}>\n") if color else "{message}\n"
+
+
 class Log:
     """Eingerueckte Protokollzeilen ueber loguru (Datei + Konsole).
 
     Der Level ergibt sich aus dem Praefix der Zeile: [FEHLER] -> ERROR, [WARN]/[KONFLIKT] -> WARNING,
-    sonst INFO. Die Datei enthaelt Zeitstempel und Level, die Konsole nur die eingerueckte Meldung.
+    sonst INFO. Die Datei enthaelt Zeitstempel und Level; die Konsole nur die eingerueckte Meldung,
+    nach Level eingefaerbt. colorize=None: NO_COLOR schaltet Farben ab, FORCE_COLOR erzwingt sie, sonst
+    automatisch nur bei Terminal (nicht bei Pipe/Umleitung).
     """
     FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
 
-    def __init__(self, path: Path, console: bool = True):
+    def __init__(self, path: Path, console: bool = True, colorize: Optional[bool] = None):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._ids = [logger.add(path, format=self.FILE_FORMAT, colorize=False, encoding="utf-8")]
         if console:
-            self._ids.append(logger.add(sys.stdout, format="{message}", colorize=False))
+            if colorize is None:
+                if os.environ.get("NO_COLOR"):
+                    colorize = False
+                elif os.environ.get("FORCE_COLOR"):
+                    colorize = True
+            self._ids.append(logger.add(sys.stdout, format=_console_format, colorize=colorize))
 
     def line(self, depth: int, text: str) -> None:
         indent = "    " * depth + ("-> " if depth else "")
@@ -198,6 +220,144 @@ class Stats:
     warnings: List[str] = field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- performance
+def fmt_secs(secs: float) -> str:
+    if secs >= 3600:
+        return f"{int(secs // 3600)}h{int(secs % 3600 // 60):02d}m"
+    if secs >= 60:
+        return f"{int(secs // 60)}m{int(secs % 60):02d}s"
+    return f"{secs:.1f}s"
+
+
+class Perf:
+    """Misst die Dauer jedes git-Befehls und jedes API-Requests, global und pro Repo.
+
+    Kategorien: `git <befehl>` (bei fetch/push mit Remote-Name, z.B. `git fetch origin`) und
+    `api <host> <branches|tags|commit-refs>`. Es werden nie Argumente oder URLs gespeichert
+    (koennten Zugangsdaten enthalten), nur Kategorie, Dauer und Repo.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, slow: float = 30.0) -> None:
+        self.slow = slow
+        self.cat: Dict[str, List[float]] = {}                  # Kategorie -> [Anzahl, Summe, Max]
+        self.repos: Dict[str, Dict[str, List[float]]] = {}     # Repo -> Kategorie -> [...]
+        self.repo_total: Dict[str, float] = {}
+        self.repo_status: Dict[str, str] = {}
+        self.slow_calls: List[Tuple[float, str, Optional[str]]] = []
+        self.repo: Optional[str] = None                        # aktuell bearbeitetes Repo
+
+    def record(self, category: str, secs: float) -> None:
+        targets = [self.cat]
+        if self.repo is not None:
+            targets.append(self.repos.setdefault(self.repo, {}))
+        for t in targets:
+            e = t.setdefault(category, [0, 0.0, 0.0])
+            e[0] += 1
+            e[1] += secs
+            e[2] = max(e[2], secs)
+        if self.slow > 0 and secs >= self.slow:
+            self.slow_calls.append((secs, category, self.repo))
+            logger.warning(f"[WARN] Langsamer Befehl: {category} {fmt_secs(secs)}"
+                           + (f" ({self.repo})" if self.repo else ""))
+
+    @contextmanager
+    def timed(self, category: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record(category, time.perf_counter() - t0)
+
+    @staticmethod
+    def is_network(category: str) -> bool:
+        return category.startswith(("api ", "git fetch ", "git push ", "git ls-remote"))
+
+    def network_secs(self, cats: Dict[str, List[float]]) -> float:
+        return sum(v[1] for k, v in cats.items() if self.is_network(k))
+
+
+PERF = Perf()
+
+
+def _git_category(args: Tuple[str, ...]) -> str:
+    """`git fetch origin`, `git push git-old`, sonst `git <befehl>`."""
+    if args[0] in ("fetch", "push", "ls-remote", "clone"):
+        for a in args[1:]:
+            if not a.startswith("-"):
+                return f"git {args[0]} {a}"
+    return f"git {args[0]}"
+
+
+def perf_group_secs(cfg: Config, cats: Dict[str, List[float]]) -> Dict[str, float]:
+    g = {"fetch_new_s": 0.0, "fetch_old_s": 0.0, "push_s": 0.0, "api_s": 0.0, "git_other_s": 0.0}
+    for k, v in cats.items():
+        if k == f"git fetch {cfg.new_remote}":
+            g["fetch_new_s"] += v[1]
+        elif k == f"git fetch {cfg.old_remote}":
+            g["fetch_old_s"] += v[1]
+        elif k.startswith("git push "):
+            g["push_s"] += v[1]
+        elif k.startswith("api "):
+            g["api_s"] += v[1]
+        else:
+            g["git_other_s"] += v[1]
+    return g
+
+
+def log_perf_report(cfg: Config, log: Log, total: float) -> None:
+    p = PERF
+    all_secs = sum(v[1] for v in p.cat.values())
+    net = p.network_secs(p.cat)
+    log.line(0, "=== Performance ===")
+    log.line(0, f"Gesamtdauer {fmt_secs(total)}; Zeit in git/API {fmt_secs(all_secs)}, davon Netzwerk "
+                f"(fetch/push/API) {fmt_secs(net)}" + (f" = {net / all_secs:.0%}" if all_secs else ""))
+    if p.cat:
+        log.line(0, "Zeit pro Befehlsart (nach Summe):")
+        for k, (n, tot, mx) in sorted(p.cat.items(), key=lambda kv: -kv[1][1]):
+            log.line(1, f"{k:<34} n={int(n):<5} Summe={fmt_secs(tot):<8} "
+                        f"Schnitt={fmt_secs(tot / n):<7} Max={fmt_secs(mx)}")
+    if p.repo_total and cfg.perf_top > 0:
+        log.line(0, f"Langsamste Repos (Top {min(cfg.perf_top, len(p.repo_total))}):")
+        for repo, tot in sorted(p.repo_total.items(), key=lambda kv: -kv[1])[:cfg.perf_top]:
+            cats = p.repos.get(repo, {})
+            g = perf_group_secs(cfg, cats)
+            log.line(1, f"{repo}: {fmt_secs(tot)} (Netzwerk {fmt_secs(p.network_secs(cats))}: "
+                        f"fetch {cfg.new_remote} {fmt_secs(g['fetch_new_s'])}, "
+                        f"fetch {cfg.old_remote} {fmt_secs(g['fetch_old_s'])}, "
+                        f"push {fmt_secs(g['push_s'])}, API {fmt_secs(g['api_s'])})")
+    if p.slow_calls:
+        log.line(0, f"Einzelbefehle ab {fmt_secs(cfg.slow_command_seconds)} ({len(p.slow_calls)}):")
+        for secs, cat, repo in sorted(p.slow_calls, reverse=True)[:20]:
+            log.line(1, f"{fmt_secs(secs)}  {cat}  {repo or ''}")
+
+
+def append_perf_csv(cfg: Config, started: datetime) -> Optional[Path]:
+    """Haengt eine Zeile pro Repo an (Spalten fuer Excel/Auswertung); leer konfiguriert = aus."""
+    if not cfg.perf_file or not PERF.repo_total:
+        return None
+    path = Path(cfg.perf_file)
+    if not path.is_absolute():
+        path = cfg.log_file.parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    cols = ["run_start", "repo", "status", "total_s", "network_s", "fetch_new_s", "fetch_old_s",
+            "push_s", "api_s", "git_other_s"]
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        if new_file:
+            w.writerow(cols)
+        for repo, tot in PERF.repo_total.items():
+            cats = PERF.repos.get(repo, {})
+            g = perf_group_secs(cfg, cats)
+            w.writerow([f"{started:%Y-%m-%d %H:%M:%S}", repo, PERF.repo_status.get(repo, ""),
+                        f"{tot:.2f}", f"{PERF.network_secs(cats):.2f}"]
+                       + [f"{g[c]:.2f}" for c in cols[5:]])
+    return path
+
+
 # --------------------------------------------------------------------------- git
 class GitError(Exception):
     pass
@@ -211,10 +371,11 @@ class Git:
 
     def run(self, *args: str, check: bool = True, input: Optional[str] = None) -> str:
         try:
-            r = subprocess.run(
-                ["git", *args], cwd=self.cwd, env=self.env, input=input,
-                capture_output=True, text=True, timeout=self.timeout,
-            )
+            with PERF.timed(_git_category(args)):
+                r = subprocess.run(
+                    ["git", *args], cwd=self.cwd, env=self.env, input=input,
+                    capture_output=True, text=True, timeout=self.timeout,
+                )
         except subprocess.TimeoutExpired:
             raise GitError(f"git {args[0]}: Timeout nach {self.timeout}s")
         if check and r.returncode != 0:
@@ -224,8 +385,9 @@ class Git:
 
     def ok(self, *args: str) -> bool:
         try:
-            subprocess.run(["git", *args], cwd=self.cwd, env=self.env, check=True,
-                           capture_output=True, timeout=self.timeout)
+            with PERF.timed(_git_category(args)):
+                subprocess.run(["git", *args], cwd=self.cwd, env=self.env, check=True,
+                               capture_output=True, timeout=self.timeout)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
@@ -286,9 +448,11 @@ def _request(host: str, token: str, path: str, query: Dict[str, object],
     """GET gegen die GitLab-API v4. Gibt (status, json, header) zurueck; 404 ist kein Fehler."""
     url = f"{pc.scheme}://{host}/api/v4{path}?{urlencode(query)}"
     req = Request(url, headers={"PRIVATE-TOKEN": token, "Accept": "application/json"})
+    kind = "tags" if path.endswith("/tags") else "branches" if path.endswith("/branches") else "commit-refs"
     try:
-        with urlopen(req, timeout=pc.timeout) as resp:
-            return resp.status, json.load(resp), resp.headers
+        with PERF.timed(f"api {host} {kind}"):
+            with urlopen(req, timeout=pc.timeout) as resp:
+                return resp.status, json.load(resp), resp.headers
     except HTTPError as e:
         if e.code == 404:
             return 404, None, e.headers
@@ -846,6 +1010,8 @@ def run(cfg: Config, only: List[str]) -> int:
     log = Log(cfg.log_file)
     stats = Stats()
     started = datetime.now()
+    t_start = time.perf_counter()
+    PERF.reset(cfg.slow_command_seconds)
     try:
         mode = "DRY-RUN (kein Push)" if cfg.dry_run else "LIVE"
         log.line(0, f"=== gitlab-sync Start {started:%Y-%m-%d %H:%M:%S} - {mode} ===")
@@ -867,7 +1033,19 @@ def run(cfg: Config, only: List[str]) -> int:
             depth = len(dirs) + 1
             log.line(depth, f"Repo {repo.name}")
             stats.repos += 1
-            if sync_repo(repo, cfg, log, depth, stats):
+            rel = repo.relative_to(cfg.root).as_posix()
+            PERF.repo = rel
+            skipped_before = stats.repos_skipped
+            t_repo = time.perf_counter()
+            ok = sync_repo(repo, cfg, log, depth, stats)
+            elapsed = time.perf_counter() - t_repo
+            PERF.repo_total[rel] = elapsed
+            PERF.repo_status[rel] = ("skipped-api" if stats.repos_skipped > skipped_before
+                                     else "ok" if ok else "problem")
+            log.line(depth + 1, f"Dauer {fmt_secs(elapsed)} (Netzwerk "
+                                f"{fmt_secs(PERF.network_secs(PERF.repos.get(rel, {})))})")
+            PERF.repo = None
+            if ok:
                 stats.repos_ok += 1
         log.line(0, "=== Zusammenfassung ===")
         log.line(0, f"Repos: {stats.repos} ({stats.repos_ok} ohne Probleme, "
@@ -891,6 +1069,11 @@ def run(cfg: Config, only: List[str]) -> int:
                 log.line(0, f"{title} ({len(items)}):")
                 for it in items:
                     log.line(1, it)
+        total = time.perf_counter() - t_start
+        log_perf_report(cfg, log, total)
+        perf_path = append_perf_csv(cfg, started)
+        if perf_path:
+            log.line(0, f"Performance je Repo in {perf_path}")
         log.line(0, f"Dauer: {datetime.now() - started}")
         return 1 if (stats.errors or stats.conflicts) else 0
     finally:

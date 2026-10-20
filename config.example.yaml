@@ -62,6 +62,12 @@ log_file: gitlab-sync.log
 # (eine Zeile pro Branch, ohne Duplikate bei gleichem Stand). Relativ zum Verzeichnis der log_file.
 conflicts_file: branch_konflikts.txt
 
+# Performance-Tracking: Dauer jedes git-Befehls und API-Requests wird gemessen. Am Ende des Laufs steht
+# eine Auswertung im Protokoll (Zeit pro Befehlsart, langsamste Repos, langsame Einzelbefehle).
+perf_file: performance.csv     # eine CSV-Zeile pro Repo und Lauf (angehaengt); leer lassen = aus
+perf_top: 10                   # Anzahl langsamste Repos in der Auswertung
+slow_command_seconds: 30       # Einzelbefehle ab dieser Dauer werden als [WARN] gemeldet (0 = aus)
+
 # true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)
 dry_run: false
 
