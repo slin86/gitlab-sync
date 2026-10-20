@@ -207,70 +207,103 @@ class SyncTests(unittest.TestCase):
     def _enable_rollback(self, **kw):
         self.cfg.jenkins_rollback = gs.JenkinsRollback(enabled=True, committers=["jenkins*"], **kw)
 
-    def test_rollback_jenkins_commits_on_conflict(self):
-        self._push_new_main(("a", "jenkins1", "jenkins"), ("b2", "x", "jenkins"))
-        jenkins_tip = git(self.new, "rev-parse", "main")
-        self._enable_rollback()
-        ok, stats = self.run_sync(False)
-        self.assertEqual(stats.commits_rolled_back, 2)
-        self.assertEqual(stats.errors, [])
-        self.assertEqual(git(self.new, "show", "main:a"), "2")  # Stand aus dem alten GitLab
-        self.assertFalse(git(self.new, "ls-tree", "main", "b2"))  # Jenkins-Commit ist weg
-        self.assertNotEqual(git(self.new, "rev-parse", "main"), jenkins_tip)
-        self.assertEqual(git(self.repo, "rev-parse", "main"), git(self.new, "rev-parse", "main"))
-        # zweiter Lauf: nichts mehr zu tun
-        ok2, stats2 = self.run_sync(False)
-        self.assertEqual(stats2.commits_rolled_back, 0)
+    def _instructions(self, stats):
+        path = gs.write_instructions(self.cfg, stats.rollbacks)
+        return path, (path.read_text() if path else "")
 
-    def test_no_rollback_if_human_commit_on_top(self):
-        self._push_new_main(("a", "jenkins1", "jenkins"), ("h", "x", "alice"))
+    def _block(self, text, marker):
+        """Inhalt des ```bash-Blocks direkt unter der Ueberschrift mit marker."""
+        part = text.split(marker, 1)[1].split("```bash\n", 1)[1].split("```", 1)[0]
+        return part
+
+    def test_jenkins_conflict_creates_instructions_and_changes_nothing(self):
+        self._push_new_main(("a", "jenkins1", "jenkins"), ("b2", "x", "jenkins"))
         before = git(self.new, "rev-parse", "main")
         self._enable_rollback()
         ok, stats = self.run_sync(False)
         self.assertFalse(ok)
-        self.assertTrue(any("Branch main" in c for c in stats.conflicts))
-        self.assertEqual(git(self.new, "rev-parse", "main"), before)
+        self.assertEqual(git(self.new, "rev-parse", "main"), before)  # kein Force-Push
+        self.assertEqual(git(self.repo, "rev-parse", "main"), before)  # lokal unveraendert
+        self.assertEqual(len(stats.rollbacks), 1)
+        item = stats.rollbacks[0]
+        self.assertEqual([c[1].split(" <")[0] for c in item.dropped], ["jenkins", "jenkins"])
+        self.assertEqual(item.new_sha, before)
+        path, text = self._instructions(stats)
+        self.assertEqual(path.name, "jenkins-rollback.md")
+        self.assertIn("protected_branches/main?allow_force_push=true", text)
+        self.assertIn("protected_branches/main?allow_force_push=false", text)
+        self.assertIn("--force-with-lease=refs/heads/main:" + before, text)
+        self.assertIn("GITLAB_NEW_TOKEN", text)
 
-    def test_no_rollback_if_human_commit_below_jenkins(self):
+    def test_generated_git_block_works_when_pasted(self):
+        self._push_new_main(("a", "jenkins1", "jenkins"), ("b2", "x", "jenkins"))
+        self._enable_rollback()
+        ok, stats = self.run_sync(False)
+        _, text = self._instructions(stats)
+        block = self._block(text, "**B)")
+        r = subprocess.run(["bash", "-c", block], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(git(self.new, "show", "main:a"), "2")  # Stand aus dem alten GitLab
+        self.assertFalse(git(self.new, "ls-tree", "main", "b2"))  # Jenkins-Commit ist weg
+        self.assertEqual(git(self.new, "rev-parse", "main"), git(self.repo, "rev-parse", "main"))
+
+    def test_git_block_aborts_if_branch_moved_in_between(self):
+        self._push_new_main(("a", "jenkins1", "jenkins"))
+        self._enable_rollback()
+        ok, stats = self.run_sync(False)
+        _, text = self._instructions(stats)
+        self._push_new_main(("late", "x", "alice"))  # jemand pusht nach der Erzeugung
+        moved = git(self.new, "rev-parse", "main")
+        r = subprocess.run(["bash", "-c", self._block(text, "**B)")], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(git(self.new, "rev-parse", "main"), moved)
+
+    def test_no_instructions_if_human_commit_on_top(self):
+        self._push_new_main(("a", "jenkins1", "jenkins"), ("h", "x", "alice"))
+        self._enable_rollback()
+        ok, stats = self.run_sync(False)
+        self.assertFalse(ok)
+        self.assertTrue(any("Branch main" in c for c in stats.conflicts))
+        self.assertEqual(stats.rollbacks, [])
+        self.assertIsNone(gs.write_instructions(self.cfg, stats.rollbacks))
+
+    def test_no_instructions_if_human_commit_below_jenkins(self):
         self._push_new_main(("a", "alice-change", "alice"), ("j", "x", "jenkins"))
-        before = git(self.new, "rev-parse", "main")
         self._enable_rollback()
         ok, stats = self.run_sync(False)
         self.assertTrue(any("Branch main" in c for c in stats.conflicts))
-        self.assertEqual(git(self.new, "rev-parse", "main"), before)
-        self.assertEqual(git(self.repo, "rev-parse", "main"), before)  # lokal zurueckgesetzt
+        self.assertEqual(stats.rollbacks, [])
 
-    def test_rollback_only_on_configured_branches_and_when_enabled(self):
+    def test_instructions_only_on_configured_branches_and_when_enabled(self):
         self._push_new_main(("a", "jenkins1", "jenkins"))
-        before = git(self.new, "rev-parse", "main")
         ok, stats = self.run_sync(False)  # nicht aktiviert
-        self.assertTrue(any("Branch main" in c for c in stats.conflicts))
+        self.assertEqual(stats.rollbacks, [])
         self._enable_rollback(branches=["release"])
         ok, stats = self.run_sync(False)
-        self.assertEqual(git(self.new, "rev-parse", "main"), before)
+        self.assertEqual(stats.rollbacks, [])
 
-    def test_rollback_max_commits(self):
+    def test_instructions_max_commits(self):
         self._push_new_main(("a", "j1", "jenkins"), ("b2", "x", "jenkins"))
-        before = git(self.new, "rev-parse", "main")
         self._enable_rollback(max_commits=1)
         ok, stats = self.run_sync(False)
-        self.assertEqual(git(self.new, "rev-parse", "main"), before)
-        self.assertEqual(stats.commits_rolled_back, 0)
+        self.assertEqual(stats.rollbacks, [])
 
-    def test_rollback_dry_run_changes_nothing(self):
+    def test_instructions_also_written_in_dry_run(self):
         self._push_new_main(("a", "jenkins1", "jenkins"))
         before = git(self.new, "rev-parse", "main")
         self._enable_rollback()
         ok, stats = self.run_sync(True)
+        self.assertEqual(len(stats.rollbacks), 1)
         self.assertEqual(git(self.new, "rev-parse", "main"), before)
-        self.assertEqual(git(self.repo, "rev-parse", "main"), before)
         self.assertEqual(git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        _, text = self._instructions(stats)
+        self.assertIn("Dry-Run", text)
 
-    def test_rollback_committer_matches_email_and_case(self):
+    def test_committer_matches_email_and_case(self):
         self._push_new_main(("a", "j", "Jenkins"))
         self.cfg.jenkins_rollback = gs.JenkinsRollback(enabled=True, committers=["JENKINS@t"])
         ok, stats = self.run_sync(False)
-        self.assertEqual(stats.commits_rolled_back, 1)
+        self.assertEqual(len(stats.rollbacks), 1)
 
     def test_discover_and_filters(self):
         self.cfg.exclude = ["grp/other*"]

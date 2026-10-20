@@ -22,12 +22,13 @@ import fnmatch
 import os
 import re
 import json
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -53,6 +54,7 @@ class JenkinsRollback:
     committers: List[str] = field(default_factory=list)   # fnmatch-Globs auf Name bzw. E-Mail
     branches: List[str] = field(default_factory=lambda: ["main"])
     max_commits: int = 50
+    instructions_file: str = "jenkins-rollback.md"
 
 
 @dataclass
@@ -125,6 +127,18 @@ class Log:
 
 
 @dataclass
+class RollbackItem:
+    """Manuell auszufuehrender Jenkins-Rollback (Anleitung), kein automatischer Eingriff."""
+    repo: Path
+    branch: str
+    new_url: str
+    new_sha: str             # aktueller Stand von branch im neuen GitLab (Lease)
+    target_sha: str          # Stand vor den Jenkins-Commits
+    dropped: List[Tuple[str, str, str]]   # (sha, committer, betreff), neueste zuerst
+    tags: List[str]
+
+
+@dataclass
 class Stats:
     repos: int = 0
     repos_ok: int = 0
@@ -135,7 +149,7 @@ class Stats:
     repos_skipped: int = 0
     tags_pushed: int = 0
     tags_overwritten: int = 0
-    commits_rolled_back: int = 0
+    rollbacks: List["RollbackItem"] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -429,15 +443,12 @@ def _sync_branch(git: Git, cfg: Config, log: Log, d: int, stats: Stats, b: str,
     new_sha = git.try_out("rev-parse", "--verify", "-q", new_ref)
     dry = cfg.dry_run
 
-    def push_branch(lease: Optional[str] = None) -> bool:
-        """lease: erwarteter Stand von b im Ziel; gesetzt = Force-Push mit Lease (nach Rollback)."""
+    def push_branch() -> bool:
         if dry:
-            what = "Force-Push (mit Lease)" if lease else "Push"
-            log.line(d + 2, f"[DRY-RUN] {what} von {b} nach {new} uebersprungen")
+            log.line(d + 2, f"[DRY-RUN] Push von {b} nach {new} uebersprungen")
             return True
         try:
-            force = [f"--force-with-lease=refs/heads/{b}:{lease}"] if lease else []
-            git.run("push", "-u", *force, new, f"refs/heads/{b}:refs/heads/{b}")
+            git.run("push", "-u", new, f"refs/heads/{b}:refs/heads/{b}")
             log.line(d + 2, f"Push {b} -> {new} OK")
             return True
         except GitError as e:
@@ -473,7 +484,6 @@ def _sync_branch(git: Git, cfg: Config, log: Log, d: int, stats: Stats, b: str,
 
     log.line(d, f"Checkout Branch {b}")
     git.run("checkout", "-f", "-B", b, new_ref)
-    lease: Optional[str] = None
     if git.is_ancestor(new_sha, old_sha):
         mode = "Fast-Forward"
         git.run("merge", "--ff-only", old_ref)
@@ -484,24 +494,23 @@ def _sync_branch(git: Git, cfg: Config, log: Log, d: int, stats: Stats, b: str,
         except GitError:
             git.run("merge", "--abort", check=False)
             git.run("checkout", "-f", "-B", b, new_ref)
-            dropped = _rollback_and_merge(git, cfg, log, d, b, new_ref, old_ref)
-            if dropped is None:
-                git.run("checkout", "-f", "-B", b, new_ref)
-                msg = f"Branch {b}: KONFLIKT beim Merge von {old}/{b} ({n} Commits) - uebersprungen"
-                log.line(d, f"[KONFLIKT] {msg}")
-                stats.conflicts.append(f"{repo}: {msg}")
-                return
-            mode = f"Merge nach Rollback von {len(dropped)} Jenkins-Commits"
-            lease = new_sha
+            found = _find_jenkins_rollback(git, cfg, log, d, b, new_ref, old_ref)
+            git.run("checkout", "-f", "-B", b, new_ref)  # nichts am Branch aendern
+            msg = f"Branch {b}: KONFLIKT beim Merge von {old}/{b} ({n} Commits) - uebersprungen"
+            if found:
+                dropped, target, tags = found
+                stats.rollbacks.append(RollbackItem(
+                    repo, b, git.run("remote", "get-url", new), new_sha, target, dropped, tags))
+                msg += (f"; {len(dropped)} Jenkins-Commits blockieren den Merge - Anleitung fuer "
+                        f"manuellen Rollback wird nach {cfg.jenkins_rollback.instructions_file} geschrieben")
+            log.line(d, f"[KONFLIKT] {msg}")
+            stats.conflicts.append(f"{repo}: {msg}")
+            return
     log.line(d, f"Synce {n} Commits {old} -> {new} ({mode})")
-    ok = push_branch(lease)
+    ok = push_branch()
     if ok:
         stats.branches_updated += 1
         stats.commits += n
-        if lease:
-            stats.commits_rolled_back += len(dropped)
-            stats.warnings.append(f"{repo}: Branch {b}: {len(dropped)} Jenkins-Commits in {new} "
-                                  f"zurueckgedreht (Force-Push): " + ", ".join(c[:10] for c in dropped))
     if dry or not ok:
         git.run("checkout", "-f", "-B", b, new_ref)  # lokalen Stand zuruecksetzen
 
@@ -512,41 +521,42 @@ def _is_jenkins(git: Git, sha: str, patterns: List[str]) -> bool:
                for pat in patterns for v in (name.strip(), email.strip()))
 
 
-def _rollback_and_merge(git: Git, cfg: Config, log: Log, d: int, b: str,
-                        new_ref: str, old_ref: str) -> Optional[List[str]]:
-    """Bei Merge-Konflikt: oberste Commits von b im neuen GitLab zurueckdrehen, solange der
-    Committer Jenkins ist, bis der Merge von old_ref klappt.
+def _find_jenkins_rollback(git: Git, cfg: Config, log: Log, d: int, b: str, new_ref: str,
+                           old_ref: str) -> Optional[Tuple[List[Tuple[str, str, str]], str, List[str]]]:
+    """Ermittelt, ob ein Merge-Konflikt auf b an Jenkins-Commits im neuen GitLab liegt.
 
-    Gibt die verworfenen Commits zurueck; der Merge ist dann lokal ausgefuehrt (Branch b zeigt auf
-    das Ergebnis). Gibt None zurueck, wenn kein Rollback moeglich war; der Aufrufer setzt b zurueck.
+    Die obersten Commits (First-Parent-Kette) von new_ref werden gedanklich einzeln entfernt, solange
+    der Committer Jenkins ist, bis der Merge von old_ref klappt (Probe-Merge, nur lokal). Es wird nichts
+    veraendert: der Aufrufer setzt den lokalen Branch zurueck und nichts wird gepusht.
+
+    Rueckgabe: (verworfene Commits [(sha, committer, betreff)], Ziel-SHA, Tags darauf) oder None,
+    wenn kein reiner Jenkins-Rollback moeglich ist.
     """
-    rb, old = cfg.jenkins_rollback, cfg.old_remote
+    rb = cfg.jenkins_rollback
     if not rb.enabled or b not in rb.branches or not rb.committers:
         return None
     base = git.try_out("merge-base", new_ref, old_ref)
     if base is None:
         return None
-    dropped: List[str] = []
+    dropped: List[Tuple[str, str, str]] = []
     for sha in git.run("rev-list", "--first-parent", f"{base}..{new_ref}").splitlines():
         who = git.run("show", "-s", "--format=%cn <%ce>", sha)
         if not _is_jenkins(git, sha, rb.committers):
-            log.line(d + 1, f"Kein Rollback moeglich: Commit {sha[:10]} ({who}) ist nicht von Jenkins")
+            log.line(d + 1, f"Kein Jenkins-Rollback moeglich: Commit {sha[:10]} ({who}) ist nicht von Jenkins")
             return None
         if len(dropped) >= rb.max_commits:
-            log.line(d + 1, f"Kein Rollback moeglich: mehr als {rb.max_commits} Jenkins-Commits")
+            log.line(d + 1, f"Kein Jenkins-Rollback moeglich: mehr als {rb.max_commits} Jenkins-Commits")
             return None
-        dropped.append(sha)
-        log.line(d + 1, f"Konflikt: drehe Jenkins-Commit {sha[:10]} ({who}) zurueck")
-        git.run("checkout", "-f", "-B", b, f"{sha}^")
+        dropped.append((sha, who, git.run("show", "-s", "--format=%s", sha)))
+        target = git.run("rev-parse", f"{sha}^")
+        git.run("checkout", "-f", "-B", b, target)
         try:
-            git.run("merge", "--no-edit", "-m", f"Sync {old} -> {cfg.new_remote}: {b}", old_ref)
+            git.run("merge", "--no-edit", "-m", f"Sync {cfg.old_remote} -> {cfg.new_remote}: {b}", old_ref)
         except GitError:
             git.run("merge", "--abort", check=False)
             continue
-        tags = sorted({t for c in dropped for t in git.run("tag", "--points-at", c).splitlines()})
-        if tags:
-            log.line(d + 1, f"Tags auf zurueckgedrehten Commits (bleiben bestehen): {', '.join(tags)}")
-        return dropped
+        tags = sorted({t for c, _, _ in dropped for t in git.run("tag", "--points-at", c).splitlines()})
+        return dropped, target, tags
     return None
 
 
@@ -621,6 +631,89 @@ def _restore(git: Git, cfg: Config, branch: Optional[str], sha: Optional[str],
         pass
 
 
+# --------------------------------------------------------------------------- instructions
+def _api_base(cfg: Config, item: RollbackItem) -> str:
+    try:
+        proj = quote(project_path(item.new_url), safe="")
+    except ValueError:
+        proj = "GRUPPE%2FPROJEKT"
+    return f"{cfg.api_precheck.scheme}://{cfg.new_host}/api/v4/projects/{proj}/protected_branches"
+
+
+def render_instructions(cfg: Config, items: List[RollbackItem]) -> str:
+    tok = cfg.api_precheck.new_token_env
+    out = [
+        "# Jenkins-Rollback: manuelle Schritte",
+        "",
+        f"Erzeugt von gitlab-sync am {datetime.now():%Y-%m-%d %H:%M:%S}"
+        + (" (Dry-Run, es wurde nichts veraendert)" if cfg.dry_run else "") + ".",
+        "",
+        f"In diesen Repos scheitert der Merge aus {cfg.old_host} an Commits von Jenkins im neuen GitLab.",
+        "Pro Repo: Bloecke der Reihe nach kopieren und im Terminal einfuegen (A, B, C).",
+        "",
+        "Voraussetzungen:",
+        f"- `{tok}` ist ein Token des neuen GitLab mit Scope `api` und mindestens Rolle Maintainer,",
+        "  z.B. `export " + tok + "=...` (nicht in die Shell-History schreiben).",
+        "- Die SHAs gelten fuer den Stand zum Zeitpunkt der Erzeugung. Hat jemand inzwischen auf den Branch",
+        "  gepusht, bricht der Force-Push durch `--force-with-lease` ab; dann gitlab-sync neu laufen lassen.",
+        "- Block B setzt den Branch hart zurueck und loescht die Jenkins-Commits im neuen GitLab. Jenkins",
+        "  baut nach dem Push neu. Tags auf den entfernten Commits bleiben bestehen.",
+        "- Block A: `PATCH` auf protected_branches gibt es ab GitLab 15.6. Bei aelteren Versionen den",
+        "  Schutz stattdessen per `DELETE` entfernen und mit `POST ...?name=<branch>&allow_force_push=true`",
+        "  neu anlegen (Zugriffslevel vorher per `GET` notieren). `404` bei A/C: Branch ist nicht geschuetzt,",
+        "  dann den API-Schritt ueberspringen.",
+        "",
+    ]
+    for it in items:
+        rel = it.repo.relative_to(cfg.root).as_posix() if cfg.root in it.repo.parents else str(it.repo)
+        br = quote(it.branch, safe="")
+        url = f"{_api_base(cfg, it)}/{br}"
+        q = shlex.quote
+        out += [
+            f"## {rel} - Branch `{it.branch}`", "",
+            f"Jenkins-Commits auf {cfg.new_remote}/{it.branch} (neueste zuerst):", "",
+        ]
+        out += [f"- `{sha[:10]}` {subj} ({who})" for sha, who, subj in it.dropped]
+        if it.tags:
+            out += ["", "Tags auf diesen Commits (bleiben bestehen): " + ", ".join(f"`{t}`" for t in it.tags)]
+        out += [
+            "", "**A) Force-Push auf dem Branch erlauben (API)**", "",
+            "```bash",
+            f': "${{{tok}:?bitte {tok} setzen}}"',
+            f'curl -sS -H "PRIVATE-TOKEN: ${tok}" {q(url)}   # aktuellen Schutz anzeigen',
+            f'curl -sS -w "\\nHTTP %{{http_code}}\\n" -X PATCH -H "PRIVATE-TOKEN: ${tok}" {q(url + "?allow_force_push=true")}',
+            "```", "",
+            "**B) Rollback, Merge und Force-Push (git)**", "",
+            "```bash",
+            f"cd {q(str(it.repo))} \\",
+            f"  && git fetch {q(cfg.new_remote)} \\",
+            f"  && git fetch {q(cfg.old_remote)} \\",
+            f"  && git checkout -f -B {q(it.branch)} {q(cfg.new_remote + '/' + it.branch)} \\",
+            f"  && git reset --hard {it.target_sha} \\",
+            f"  && git merge --no-edit {q(cfg.old_remote + '/' + it.branch)} \\",
+            f"  && git push --force-with-lease={q('refs/heads/' + it.branch + ':' + it.new_sha)} "
+            f"{q(cfg.new_remote)} {q(it.branch)}",
+            "```", "",
+            "**C) Force-Push wieder verbieten (API)**", "",
+            "```bash",
+            f'curl -sS -w "\\nHTTP %{{http_code}}\\n" -X PATCH -H "PRIVATE-TOKEN: ${tok}" {q(url + "?allow_force_push=false")}',
+            "```", "",
+        ]
+    return "\n".join(out)
+
+
+def write_instructions(cfg: Config, items: List[RollbackItem]) -> Optional[Path]:
+    """Schreibt die gesammelten Anleitungen (ueberschreibt eine alte Datei); None, wenn keine noetig."""
+    if not items:
+        return None
+    path = Path(cfg.jenkins_rollback.instructions_file)
+    if not path.is_absolute():
+        path = cfg.log_file.parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_instructions(cfg, items), encoding="utf-8")
+    return path
+
+
 # --------------------------------------------------------------------------- main
 def run(cfg: Config, only: List[str]) -> int:
     log = Log(cfg.log_file)
@@ -654,8 +747,10 @@ def run(cfg: Config, only: List[str]) -> int:
                     f"{stats.repos_skipped} per API-Vorabpruefung uebersprungen)")
         log.line(0, f"Branches: {stats.branches_new} neu, {stats.branches_updated} aktualisiert, "
                     f"{stats.branches_current} aktuell; Commits gesynct: {stats.commits}; "
-                    f"Tags: {stats.tags_pushed} neu, {stats.tags_overwritten} ueberschrieben; "
-                    f"Jenkins-Commits zurueckgedreht: {stats.commits_rolled_back}")
+                    f"Tags: {stats.tags_pushed} neu, {stats.tags_overwritten} ueberschrieben")
+        written = write_instructions(cfg, stats.rollbacks)
+        if written:
+            log.line(0, f"Jenkins-Rollback: Anleitung fuer {len(stats.rollbacks)} Branch(es) in {written}")
         for title, items in (("Konflikte", stats.conflicts), ("Fehler", stats.errors),
                              ("Warnungen", stats.warnings)):
             if items:

@@ -33,26 +33,39 @@ Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeich
    im neuen GitLab überschrieben (alt → neu, Force-Push nur für diese Tags), sonst nur Warnung
 5. ursprünglich ausgecheckten Branch wiederherstellen (`restore_branch`)
 
-Es wird nie ein Branch oder Tag gelöscht und kein Branch force-gepusht (Force-Push nur für abweichende Tags bei `overwrite_tags`). Branches, die nur im neuen GitLab
+Das Tool löscht nie einen Branch oder Tag und pusht keinen Branch mit Force (Force-Push nur für abweichende Tags bei `overwrite_tags`; Jenkins-Rollbacks nur als Anleitung, siehe unten). Branches, die nur im neuen GitLab
 existieren, bleiben unverändert. Ein lokaler Branch mit unveröffentlichten Commits wird übersprungen (Warnung).
 
-## Jenkins-Rollback (optional)
+## Jenkins-Rollback: Anleitung statt Eingriff (optional)
 
 Baut Jenkins im neuen GitLab bei Pushes auf `main` und erzeugt dabei eigene Commits/Tags, kann der Merge
-aus dem alten GitLab daran scheitern. Mit `jenkins_rollback.enabled: true` gilt bei einem **Merge-Konflikt**
-auf den Branches aus `jenkins_rollback.branches` (Default `main`):
+aus dem alten GitLab daran scheitern. Mit `jenkins_rollback.enabled: true` prüft das Tool bei einem
+**Merge-Konflikt** auf den Branches aus `jenkins_rollback.branches` (Default `main`), ob ein reiner
+Jenkins-Rollback helfen würde:
 
-1. Die obersten Commits (First-Parent-Kette) von `main` im neuen GitLab werden einzeln zurückgedreht,
-   **solange ihr Committer Jenkins ist**. Maßgeblich ist der Committer, nicht der Autor; `committers` sind
-   fnmatch-Globs (Groß-/Kleinschreibung egal) auf Committer-Name oder -E-Mail, z.B. `["jenkins*"]`.
-2. Nach jedem Schritt wird der Merge erneut versucht. Klappt er, wird das Ergebnis mit
-   `git push --force-with-lease` (erwarteter Stand = der gerade geholte) nach `origin` geschrieben.
-3. Ist ein Commit darunter nicht von Jenkins, oder werden mehr als `max_commits` (Default 50) Commits
-   gebraucht, wird nichts zurückgedreht: normaler `[KONFLIKT]`, der Branch bleibt unverändert.
+1. Die obersten Commits (First-Parent-Kette) von `main` im neuen GitLab werden gedanklich einzeln entfernt,
+   **solange ihr Committer Jenkins ist** (Committer, nicht Autor; `committers` sind fnmatch-Globs auf
+   Name bzw. E-Mail, Groß-/Kleinschreibung egal, z.B. `["jenkins*"]`). Nach jedem Schritt wird ein
+   Probe-Merge versucht (nur lokal).
+2. Das Tool ändert **nichts**: der Branch bleibt lokal und im neuen GitLab unverändert, der Konflikt wird
+   normal protokolliert. Stattdessen schreibt es die Datei `instructions_file` (Default
+   `jenkins-rollback.md`, neben der Logdatei; wird bei jedem Lauf mit Anleitungen überschrieben).
+3. Ist ein Commit darunter nicht von Jenkins oder werden mehr als `max_commits` (Default 50) gebraucht,
+   gibt es keine Anleitung (normaler Konflikt, manuell klären).
 
-Tags auf zurückgedrehten Commits werden nicht gelöscht (nur Hinweis im Protokoll). Jeder Rollback steht
-als Warnung in der Zusammenfassung, inklusive der verworfenen Commit-Hashes. Im Dry-Run wird der Rollback
-nur lokal durchgespielt und anschließend zurückgesetzt; es wird nichts gepusht.
+Pro Repo enthält die Datei drei Blöcke zum Kopieren:
+
+- **A)** `curl`-Befehle gegen die GitLab-API: Schutz anzeigen und `allow_force_push=true` auf dem
+  geschützten Branch setzen (`PATCH /projects/:id/protected_branches/:name`, ab GitLab 15.6).
+- **B)** git-Befehle, mit `&&` verkettet (bricht beim ersten Fehler ab): fetch, Branch auf `origin/main`,
+  `reset --hard` auf den Stand vor den Jenkins-Commits, Merge von `git-old/main`, danach
+  `push --force-with-lease=refs/heads/main:<erwarteter SHA>`. Hat jemand dazwischen gepusht, lehnt der
+  Push ab.
+- **C)** `allow_force_push=false`: Schutz wieder herstellen.
+
+Die API-Blöcke brauchen ein Token des neuen GitLab mit Scope `api` und Rolle Maintainer (Variablenname
+wie `api_precheck.new_token_env`, Default `GITLAB_NEW_TOKEN`). Tags auf den entfernten Commits bleiben
+bestehen und sind in der Anleitung aufgelistet. Die Datei entsteht auch im Dry-Run.
 
 ## API-Vorabpruefung (optional)
 
