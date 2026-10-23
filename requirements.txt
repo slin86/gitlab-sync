@@ -1,2 +1,0 @@
-PyYAML>=5.4
-loguru>=0.7

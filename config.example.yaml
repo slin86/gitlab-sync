@@ -1,54 +1,54 @@
-# Kopieren nach config.yaml und anpassen.
-# Relative Pfade gelten relativ zu dieser Datei; ~ und $VARS werden aufgeloest.
+# Copy to config.yaml and adjust.
+# Relative paths are resolved against this file; ~ and $VARS are expanded.
 
-# Wurzelverzeichnis mit der verschachtelten Ordnerstruktur (jedes Verzeichnis mit .git ist ein Repo)
+# Root of the nested folder structure. Every directory that contains .git is a repo.
 root: ~/work/gitlab
 
-# Hosts: origin muss auf new_host zeigen; die URL des alten GitLab entsteht,
-# indem nur der Host durch old_host ersetzt wird (Pfad/Protokoll/User bleiben).
+# origin must point to new_host. The URL of the old instance is derived by replacing only the
+# host; scheme, user and project path stay the same.
 new_host: gitlab.example.com
 old_host: git.example.com
 
-# Remote-Namen
-new_remote: origin      # neues GitLab (Ziel)
-old_remote: git-old     # altes GitLab (Quelle), wird bei Bedarf angelegt
+# Remote names
+new_remote: origin      # new instance, the sync target
+old_remote: git-old     # old instance, the sync source; added when missing
 
-# Optionale Filter auf den Pfad relativ zu root (fnmatch-Globs, '*' matcht auch '/')
+# Optional filters on the repo path relative to root (fnmatch globs, '*' also matches '/')
 include: []
-exclude:
-  # - "archiv/*"
+exclude: []
+  # e.g. ["archive/*"]
 
-# Branch-Namen, die in allen Repos nicht gesynct werden (fnmatch-Globs, z.B. "wip/*")
+# Branch names that are never synced in any repo (fnmatch globs)
 exclude_branches: [dependabot*, renovate/*]
 
-# true: Tags, die in beiden GitLabs gleich heissen, aber auf unterschiedliche Commits zeigen,
-# werden im neuen GitLab mit dem Stand des alten ueberschrieben (Force-Push, alt -> neu).
-# false: nur Warnung im Protokoll. Geschuetzte Tags im Ziel koennen den Push ablehnen.
+# true: a tag with the same name but a different target on both instances is overwritten on the
+# new instance with the state of the old one (force push of that tag only).
+# false: the difference is only reported. Protected tags on the new instance can reject the push.
 overwrite_tags: true
 
-# Jenkins baut bei Pushes auf main im neuen GitLab und erzeugt dabei Commits/Tags, die den Merge
-# aus dem alten GitLab blockieren koennen. Bei einem Merge-Konflikt auf einem der Branches prueft das
-# Tool (nur lesend/lokal), ob die obersten Commits im neuen GitLab von Jenkins stammen (COMMITTER) und
-# ob der Merge nach deren Entfernung klappt. Das Tool veraendert dann NICHTS, sondern sammelt
-# copy&paste-fertige Anweisungen (API: Force-Push erlauben, git: Rollback + Merge + Push, API: wieder
-# verbieten) in instructions_file. Die Datei wird bei jedem Lauf mit Anleitungen neu geschrieben.
+# Jenkins builds on pushes to main on the new instance and creates commits and tags that can block
+# the merge from the old instance. On a merge conflict on one of the branches below the tool checks
+# locally whether the newest commits on the new instance were committed by Jenkins and whether the
+# merge works once they are removed. It never changes anything itself; it writes copy and paste
+# instructions (API: allow force push, git: rollback, merge, push, API: disallow force push) to
+# instructions_file. The file is replaced on every run that has instructions.
 jenkins_rollback:
   enabled: true
-  committers: ["jenkins*"]   # fnmatch-Globs (ohne Gross-/Kleinschreibung) auf Committer-Name oder -E-Mail
+  committers: ["jenkins*"]   # case insensitive fnmatch globs on committer name or email
   branches: [main]
-  max_commits: 50            # Sicherheitslimit pro Branch
-  instructions_file: jenkins-rollback.md   # relativ zum Verzeichnis der log_file
+  max_commits: 50            # safety limit per branch
+  instructions_file: jenkins_rollback.md
 
-# Wird ein Push auf einen geschuetzten Branch abgelehnt ("You are not allowed to push code to protected
-# branches"), landet das Repo mit Link zur Seite "Protected branches" in dieser Datei (ohne Duplikate,
-# relativ zum Verzeichnis der log_file). Der Seitenpfad haengt von der GitLab-Version ab.
+# A push that is rejected with "You are not allowed to push code to protected branches" adds the
+# repo with a link to its protected branches settings to this file. The page path depends on the
+# GitLab version.
 protected_branches_file: protected_branches.md
 protected_branches_page: "/-/settings/repository#js-protected-branches-settings"
 
-# Vorabpruefung per GitLab-API (v4): fragt Branches/Tags beider Instanzen ab und ueberspringt
-# das Repo komplett (kein fetch/checkout), wenn das alte GitLab nichts Neues hat.
-# Tokens (Scope read_api) kommen aus Umgebungsvariablen, nie aus dieser Datei.
-# Schlaegt die Pruefung fehl (Token fehlt, Fehler, Projekt nicht gefunden), laeuft der volle Sync.
+# API precheck: compares branches and tags of both instances through the GitLab API before any
+# fetch and skips the repo when the old instance has nothing new. Tokens with scope read_api are
+# read from environment variables, never from this file. If the check fails (missing token, network
+# error, project not found) the repo gets a full sync.
 api_precheck:
   enabled: true
   new_token_env: GITLAB_NEW_TOKEN
@@ -56,23 +56,21 @@ api_precheck:
   scheme: https
   timeout: 15
 
-log_file: gitlab-sync.log
+log_file: gitlab_sync.log
 
-# Branches, die nicht automatisch gemerged werden konnten (Merge-Konflikt), werden hier angehaengt
-# (eine Zeile pro Branch, ohne Duplikate bei gleichem Stand). Relativ zum Verzeichnis der log_file.
-conflicts_file: branch_konflikts.txt
+# Branches that could not be merged are appended here, one line per branch and state.
+conflicts_file: branch_conflicts.txt
 
-# Performance-Tracking: Dauer jedes git-Befehls und API-Requests wird gemessen. Am Ende des Laufs steht
-# eine Auswertung im Protokoll (Zeit pro Befehlsart, langsamste Repos, langsame Einzelbefehle).
-perf_file: performance.csv     # eine CSV-Zeile pro Repo und Lauf (angehaengt); leer lassen = aus
-perf_top: 10                   # Anzahl langsamste Repos in der Auswertung
-slow_command_seconds: 30       # Einzelbefehle ab dieser Dauer werden als [WARN] gemeldet (0 = aus)
+# Performance tracking. Every git command and API request is timed; the run log ends with a report.
+perf_file: performance.csv     # one row per repo and run, appended; leave empty to disable
+perf_top: 10                   # number of slowest repos in the report
+slow_command_seconds: 30       # single commands at or above this are logged as warnings, 0 disables
 
-# true = alles ausser dem Push (auch per --dry-run auf der Kommandozeile)
+# true: do everything except pushing (same as --dry-run)
 dry_run: false
 
-# Nach dem Sync pro Repo den urspruenglich ausgecheckten Branch wiederherstellen
+# Check out the originally checked out branch again after each repo
 restore_branch: true
 
-# Timeout je git-Befehl in Sekunden
+# Timeout per git command in seconds
 git_timeout: 600

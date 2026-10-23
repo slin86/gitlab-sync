@@ -1,143 +1,152 @@
-# gitlab-sync
+# gitlab_sync
 
-Holt Änderungen aus dem alten GitLab (`git.example.com`) in die lokal ausgecheckten Repos des
-neuen GitLab (`gitlab.example.com`) und pusht sie dorthin.
+Moves ongoing work from an old GitLab instance (git.example.com) into local checkouts of the new
+instance (gitlab.example.com) and pushes it there. Both instances started from the same copy, so users,
+projects, commits and merge requests exist on both. Development continues on the old one until the
+switch, and this tool keeps the new one up to date.
 
 ## Setup
 
-    pip install -r requirements.txt
-    cp config.example.yaml config.yaml   # anpassen
+Python 3.9 or newer.
 
-Authentifizierung läuft über die vorhandenen git-Credentials (SSH-Keys / Credential-Helper);
-das Tool setzt `GIT_TERMINAL_PROMPT=0`, hängt also nie an einer Passwortabfrage.
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -e ".[dev]"
+cp config.example.yaml config.yaml
+```
 
-## Aufruf
+Git authentication uses the existing credentials of the machine (SSH keys or a credential helper). The
+tool sets `GIT_TERMINAL_PROMPT=0`, so it never waits for a password prompt.
 
-    python gitlab_sync.py -c config.yaml              # live
-    python gitlab_sync.py -c config.yaml --dry-run    # alles ausser Push
-    python gitlab_sync.py --only "team-a/*" --only "team-b/repo"   # nur ausgewählte Repos
+## Usage
 
-Exit-Code 0 = alles ok, 1 = Fehler oder Konflikte aufgetreten, 2 = Root-Verzeichnis fehlt.
+```bash
+gitlab_sync -c config.yaml                      # live run
+gitlab_sync -c config.yaml --dry-run            # everything except pushing
+gitlab_sync --only "team-a/*" --only "team-b/repo"
+python -m gitlab_sync -c config.yaml            # same without the console script
+```
 
-## Ablaufdiagramm
+Exit codes: 0 when everything was fine, 1 when a repo had errors or conflicts, 2 when the config is
+invalid or the root directory does not exist.
 
-Gesamtablauf und Ablauf pro Branch als Flussdiagramm: [docs/ablauf.md](docs/ablauf.md) (Mermaid, wird in
-GitLab/GitHub direkt gerendert; als Bild: [Gesamtablauf](docs/ablauf-gesamt.png),
-[pro Branch](docs/ablauf-branch.png)). Wer die Diagramme in `docs/ablauf.md` ändert, muss die Bilder neu
-rendern (z.B. mit `mmdc` aus `@mermaid-js/mermaid-cli`).
+## What happens per repo
 
-## Ablauf pro Repo
+The flow is drawn in [docs/flow.md](docs/flow.md) ([overall](docs/flow_overall.png),
+[per branch](docs/flow_branch.png)).
 
-1. lokale Änderungen verwerfen (`reset --hard`, `clean -fd`), `fetch` von `origin`
-2. Remote `git-old` anlegen: URL = origin-URL mit ersetztem Host (SSH-scp, `ssh://` und `https://`)
-3. pro Branch des alten GitLab:
-   - fehlt im neuen: Branch anlegen und pushen
-   - bereits enthalten: nichts tun
-   - sonst Fast-Forward, falls möglich, andernfalls Merge-Commit; bei Konflikt `merge --abort`,
-     Eintrag `[KONFLIKT]` im Protokoll, weiter mit dem nächsten Branch
-   - Push nach `origin` (Dry-Run: Merge wird lokal getestet und danach zurückgesetzt, nur der Push entfällt)
-4. neue Tags übertragen; Tags mit gleichem Namen, aber anderem Commit werden mit `overwrite_tags: true`
-   im neuen GitLab überschrieben (alt → neu, Force-Push nur für diese Tags), sonst nur Warnung
-5. ursprünglich ausgecheckten Branch wiederherstellen (`restore_branch`)
+1. Optional API precheck. If the old instance has nothing the new one is missing, the repo is skipped
+   without any fetch or checkout.
+2. Local changes are discarded, origin is fetched and the remote of the old instance is added if it is
+   missing. Its URL is the origin URL with the host replaced.
+3. Every branch of the old instance:
+   * missing on the new instance: created and pushed
+   * already contained in the new branch: nothing to do
+   * otherwise fast forward if possible, else a merge commit; on a conflict the merge is aborted, the
+     branch stays as it is and the conflict is recorded
+   * in a dry run everything happens locally and is reset afterwards; only the push is skipped
+4. Tags that are missing on the new instance are pushed. Tags with a different target are overwritten
+   when `overwrite_tags` is set, otherwise only reported.
+5. The previously checked out branch is checked out again.
 
-Das Tool löscht nie einen Branch oder Tag und pusht keinen Branch mit Force (Force-Push nur für abweichende Tags bei `overwrite_tags`; Jenkins-Rollbacks nur als Anleitung, siehe unten). Branches, die nur im neuen GitLab
-existieren, bleiben unverändert. Ein lokaler Branch mit unveröffentlichten Commits wird übersprungen (Warnung).
+The tool never deletes a branch or tag and never force pushes a branch. Branches that only exist on the
+new instance are left alone. A local branch with unpublished commits is skipped with a warning.
 
-## Jenkins-Rollback: Anleitung statt Eingriff (optional)
+## Output
 
-Baut Jenkins im neuen GitLab bei Pushes auf `main` und erzeugt dabei eigene Commits/Tags, kann der Merge
-aus dem alten GitLab daran scheitern. Mit `jenkins_rollback.enabled: true` prüft das Tool bei einem
-**Merge-Konflikt** auf den Branches aus `jenkins_rollback.branches` (Default `main`), ob ein reiner
-Jenkins-Rollback helfen würde:
+The run log is written with loguru to `log_file` (appended, `time | level | message`) and to the
+console (indented message only). On the console errors are red and warnings and conflicts yellow.
+Colors are only used on a terminal; `NO_COLOR=1` disables them and `FORCE_COLOR=1` forces them.
 
-1. Die obersten Commits (First-Parent-Kette) von `main` im neuen GitLab werden gedanklich einzeln entfernt,
-   **solange ihr Committer Jenkins ist** (Committer, nicht Autor; `committers` sind fnmatch-Globs auf
-   Name bzw. E-Mail, Groß-/Kleinschreibung egal, z.B. `["jenkins*"]`). Nach jedem Schritt wird ein
-   Probe-Merge versucht (nur lokal).
-2. Das Tool ändert **nichts**: der Branch bleibt lokal und im neuen GitLab unverändert, der Konflikt wird
-   normal protokolliert. Stattdessen schreibt es die Datei `instructions_file` (Default
-   `jenkins-rollback.md`, neben der Logdatei; wird bei jedem Lauf mit Anleitungen überschrieben).
-3. Ist ein Commit darunter nicht von Jenkins oder werden mehr als `max_commits` (Default 50) gebraucht,
-   gibt es keine Anleitung (normaler Konflikt, manuell klären).
+```
+Syncing folder /work/gitlab (12 repos)
+    -> Syncing folder team-a
+        -> Repo repo-x
+            -> Fetching origin (git@gitlab.example.com:team-a/repo-x.git)
+            -> Adding remote git-old: git@git.example.com:team-a/repo-x.git
+            -> Checking out branch main
+            -> Syncing 123 commits from git-old to origin (fast forward)
+```
 
-Pro Repo enthält die Datei drei Blöcke zum Kopieren:
+The following files are written next to the log file. Their names can be changed in the config. The
+lists are appended to and skip entries that are already present.
 
-- **A)** `curl`-Befehle gegen die GitLab-API: Schutz anzeigen und `allow_force_push=true` auf dem
-  geschützten Branch setzen (`PATCH /projects/:id/protected_branches/:name`, ab GitLab 15.6).
-- **B)** git-Befehle, mit `&&` verkettet (bricht beim ersten Fehler ab): fetch, Branch auf `origin/main`,
-  `reset --hard` auf den Stand vor den Jenkins-Commits, Merge von `git-old/main`, danach
-  `push --force-with-lease=refs/heads/main:<erwarteter SHA>`. Hat jemand dazwischen gepusht, lehnt der
-  Push ab.
-- **C)** `allow_force_push=false`: Schutz wieder herstellen.
+* `branch_conflicts.txt`: branches that could not be merged, one line per branch and state:
+  `time | repo | branch | git-old=<sha> | origin=<sha> | N commits`.
+* `protected_branches.md`: repos whose push was rejected with "You are not allowed to push code to
+  protected branches", with a link to the protected branches settings of the project. Allow the
+  Maintainer role to push and merge there and run the sync again. The page path is configurable in
+  `protected_branches_page` because it depends on the GitLab version.
+* `jenkins_rollback.md`: manual rollback steps, see below. Replaced on every run that has any.
+* `performance.csv`: timings per repo, see below.
 
-Die API-Blöcke brauchen ein Token des neuen GitLab mit Scope `api` und Rolle Maintainer (Variablenname
-wie `api_precheck.new_token_env`, Default `GITLAB_NEW_TOKEN`). Tags auf den entfernten Commits bleiben
-bestehen und sind in der Anleitung aufgelistet. Die Datei entsteht auch im Dry-Run.
+## API precheck
 
-## API-Vorabpruefung (optional)
+With `api_precheck.enabled` the tool asks the API of both instances before touching a repo:
 
-Mit `api_precheck.enabled: true` fragt das Tool vor jedem fetch per GitLab-API (v4) Branches und Tags
-beider Instanzen ab und ueberspringt das Repo komplett, wenn das alte GitLab nichts Neues hat
-(kein fetch, kein Checkout, kein `git-old`-Remote). Als "neu" gilt:
+* one request per instance for all branches with their head commits (100 per page)
+* for a branch whose head differs, one request whether the new branch already contains the old head
+* only if all branches match, one request per instance for the tags
 
-- ein Branch (ausser `exclude_branches`) oder Tag, der im neuen GitLab fehlt (bei `overwrite_tags` auch ein Tag mit anderem Ziel), oder
-- ein Branch-Head, der im neuen GitLab unbekannt oder nicht im gleichnamigen Branch enthalten ist.
+The repo is skipped when nothing is missing on the new instance. Tokens with scope `read_api` are read
+from `GITLAB_NEW_TOKEN` and `GITLAB_OLD_TOKEN`. When the check is not possible the repo gets a full sync
+and the log contains a warning.
 
-Tokens (Scope `read_api`) werden aus den Umgebungsvariablen `GITLAB_NEW_TOKEN` und
-`GITLAB_OLD_TOKEN` gelesen (Namen in der Config aenderbar). Ist die Pruefung nicht moeglich
-(Token fehlt, Netzwerk-/API-Fehler, Projekt nicht gefunden), laeuft der volle Sync wie bisher.
+## Jenkins rollback instructions
 
-## Protokoll
+Jenkins builds on pushes to main on the new instance and creates its own commits and tags, which can
+block the merge from the old instance. With `jenkins_rollback.enabled` a merge conflict on one of the
+configured branches is analysed locally: the newest commits of the new branch are dropped one by one
+as long as their committer matches `committers`, and a merge is tried after each step. The tool does not
+change anything. When such a rollback would solve the conflict it writes three blocks per repo to
+`jenkins_rollback.md`:
 
-Das Protokoll läuft über [loguru](https://github.com/Delgan/loguru): eingerückte Textdatei (`log_file`,
-wird angehängt, Format `Zeit | Level | Meldung`) plus Konsole (nur die eingerückte Meldung). Level:
-`[FEHLER]` → ERROR, `[WARN]`/`[KONFLIKT]` → WARNING, sonst INFO. Auf der Konsole sind Fehler rot und
-Warnungen/Konflikte gelb; Farben gibt es nur im Terminal (nicht bei Pipe oder Umleitung), `NO_COLOR=1`
-schaltet sie ab, `FORCE_COLOR=1` erzwingt sie. Die Logdatei enthält nie Farbcodes. Am Ende steht eine Zusammenfassung mit
-Konflikten, Fehlern und Warnungen:
+* A: API calls that show the branch protection and allow force push on the branch
+* B: git commands chained with `&&` that reset the branch, merge and push with
+  `--force-with-lease`, so the push fails if someone pushed in the meantime
+* C: an API call that disallows force push again
 
-    Synce Ordner /work/gitlab (12 Repos)
-        -> Synce Ordner team-a
-            -> Repo repo-x
-                -> Update origin (git@gitlab.example.com:team-a/repo-x.git)
-                -> Fuege git-old hinzu: git@git.example.com:team-a/repo-x.git
-                -> Checkout Branch main
-                -> Synce 123 Commits git-old -> origin (Fast-Forward)
+The API blocks need a token with scope `api` and the Maintainer role. A non Jenkins commit in the way or
+more than `max_commits` commits means no instructions, only the normal conflict.
 
-## Performance-Tracking
+## Performance tracking
 
-Jeder git-Befehl und jeder API-Request wird gemessen (Kategorie, Dauer, Repo; nie Argumente oder URLs, da
-diese Zugangsdaten enthalten können). Kategorien: `git fetch origin`, `git fetch git-old`, `git push origin`,
-`git merge` usw. sowie `api <host> branches|tags|commit-refs`. So sieht man, ob das alte oder das neue GitLab
-bzw. die API bremst.
+Every git command and API request is timed by category (`git fetch origin`, `git fetch git-old`,
+`git push origin`, `api <host> branches` and so on). Arguments and URLs are never stored because they
+can contain credentials. Each repo logs its duration and network share, single commands slower than
+`slow_command_seconds` are logged as warnings, and the run ends with a report of the time per command
+type, the slowest repos and the slowest commands. `performance.csv` gets one row per repo and run with
+the columns `run_start, repo, status, total_s, network_s, fetch_new_s, fetch_old_s, push_s, api_s,
+git_other_s`.
 
-- **Pro Repo** im Protokoll: `Dauer 12.3s (Netzwerk 11.8s)`.
-- **Am Ende des Laufs** eine Auswertung: Gesamtdauer und Netzwerkanteil, Zeit pro Befehlsart (Anzahl, Summe,
-  Schnitt, Maximum), die `perf_top` langsamsten Repos mit Aufschlüsselung (fetch neu/alt, push, API) und alle
-  Einzelbefehle ab `slow_command_seconds` (Default 30).
-- Einzelbefehle ab dieser Schwelle werden sofort als `[WARN] Langsamer Befehl: git fetch git-old 42.1s (team-a/repo-x)`
-  gemeldet, damit man beim laufenden Sync sieht, wo es hakt. `0` schaltet das ab.
-- **`performance.csv`** (`perf_file`, leer = aus): eine Zeile pro Repo und Lauf, angehängt, Spalten
-  `run_start, repo, status (ok|problem|skipped-api), total_s, network_s, fetch_new_s, fetch_old_s, push_s,
-  api_s, git_other_s`. Gut für Excel oder zum Vergleich mehrerer Läufe (z.B. mit und ohne `api_precheck`).
+## Development
 
-## Sammeldateien
+```bash
+pytest
+ruff check src tests
+ruff format src tests
+```
 
-Alle liegen neben der `log_file` (Pfad jeweils in der Config änderbar), werden angehängt und enthalten
-keine Duplikate bei gleichem Stand. Sie entstehen auch im Dry-Run, soweit der Anlass ohne Push erkennbar ist.
+```
+src/gitlab_sync/
+  cli.py          command line entry point
+  config.py       configuration model and YAML loader
+  runner.py       walks all repos and writes summary, reports and timings
+  sync/           sync of one repo: repo.py, branch.py, tags.py, jenkins.py
+  precheck.py     API precheck
+  gitlab_api.py   minimal GitLab API client
+  git.py          git command wrapper
+  reports.py      conflict, protected branch and Jenkins rollback files
+  summary.py      summary and performance report in the log
+  perf.py         timing collection and CSV
+  log.py          indented log on top of loguru
+  urls.py         remote URL parsing
+  discovery.py    finds repos below root
+```
 
-- **`branch_konflikts.txt`** (`conflicts_file`): Branches, die nicht gemerged werden konnten. Eine Zeile pro
-  Branch: `Zeit | Repo | Branch | git-old=<SHA> | origin=<SHA> | N Commits`, ggf. mit dem Zusatz
-  `Jenkins-Rollback-Anleitung`.
-- **`protected_branches.md`** (`protected_branches_file`): Repos, bei denen der Push mit
-  `GitLab: You are not allowed to push code to protected branches on this project.` abgelehnt wurde
-  (der Maintainer darf nicht in den Branch pushen). Eine Zeile pro Repo und Branch mit Link direkt zur
-  Seite „Protected branches“ (Settings → Repository) des Projekts im neuen GitLab. Dort beim Branch unter
-  „Allowed to push and merge“ die Rolle Maintainer erlauben und das Tool erneut laufen lassen. Der Seitenpfad
-  (`protected_branches_page`, Default `/-/settings/repository#js-protected-branches-settings`) kann je nach
-  GitLab-Version abweichen. Im Dry-Run gibt es keinen Push und damit keine Einträge.
-- **`jenkins-rollback.md`**: siehe oben.
+## Limitations
 
-## Tests
-
-    python -m unittest -v
+* Repos that were created on the old instance but do not exist on the new one yet are not handled.
+* The diagrams in `docs/flow.md` are the source; the PNG and SVG files have to be rendered again after a
+  change, for example with `mmdc` from `@mermaid-js/mermaid-cli`.
