@@ -1,84 +1,67 @@
 import pytest
 
-from gitlab_sync.audit.permissions import access_level, check_push_permissions, push_allowed
+from gitlab_sync.audit.permissions import check_push_permissions, describe_push_access, maintainers_may_push
 from gitlab_sync.results import FindingKind
 
-USER = {"id": 7, "username": "dev", "is_admin": False}
-LINK = "https://gitlab.example.com/grp/repo/-/settings/repository"
+LINK = "https://gitlab.example.com/grp/repo/-/settings/repository#js-protected-branches-settings"
 
 
-def project(project_level=None, group_level=None):
-    return {
-        "permissions": {
-            "project_access": {"access_level": project_level} if project_level else None,
-            "group_access": {"access_level": group_level} if group_level else None,
-        }
-    }
+def level(value, description=None, **extra):
+    entry = {"access_level": value, **extra}
+    if description:
+        entry["access_level_description"] = description
+    return entry
 
 
 def rule(name, *entries):
     return {"name": name, "push_access_levels": list(entries)}
 
 
-def test_access_level_uses_the_highest_and_treats_admins_as_owner():
-    assert access_level(project(30, 40), USER) == 40
-    assert access_level(project(), USER) == 0
-    assert access_level(project(), {**USER, "is_admin": True}) == 50
-
-
 @pytest.mark.parametrize(
-    ("entries", "level", "expected"),
+    ("entries", "expected"),
     [
-        ([{"access_level": 40}], 40, True),
-        ([{"access_level": 40}], 30, False),
-        ([{"access_level": 0}], 50, False),
-        ([{"access_level": 40, "user_id": 7}], 30, True),
-        ([{"access_level": 40, "group_id": 3}], 40, None),
-        ([], 50, False),
+        ([level(40, "Maintainers")], True),
+        ([level(30, "Developers + Maintainers")], True),
+        ([level(0, "No one")], False),
+        ([level(60, "Admins")], False),
+        ([level(40, "nils", user_id=7)], False),
+        ([level(40, "backend", group_id=3)], False),
+        ([level(0, "No one"), level(40, "Maintainers")], True),
+        ([], False),
     ],
 )
-def test_push_allowed(entries, level, expected):
-    assert push_allowed(rule("main", *entries), level, 7) is expected
+def test_maintainers_may_push(entries, expected):
+    assert maintainers_may_push(rule("main", *entries)) is expected
 
 
-def test_no_findings_when_maintainers_may_push():
-    findings = check_push_permissions(
-        "grp/repo", project(40), USER, [rule("main", {"access_level": 40})], ["main"], LINK
-    )
-    assert findings == []
+def test_maintainers_allowed_on_master_gives_no_finding():
+    protected = [rule("master", level(40, "Maintainers"))]
+    assert check_push_permissions("grp/repo", protected, ["master", "feature"], LINK) == []
 
 
-def test_protected_branch_without_push_rights():
-    protected = [rule("main", {"access_level": 0}), rule("release/*", {"access_level": 40}), rule("x")]
-    findings = check_push_permissions(
-        "grp/repo", project(40), USER, protected, ["main", "release/1", "release/2"], LINK
-    )
+def test_rule_that_blocks_maintainers():
+    protected = [rule("main", level(0, "No one")), rule("release/*", level(40, "Maintainers")), rule("x")]
+    findings = check_push_permissions("grp/repo", protected, ["main", "release/1"], LINK)
     assert [f.message for f in findings] == [
-        "user dev (maintainer) may not push to protected branch main (affects main)"
+        "protected branch main does not allow Maintainers to push (allowed to push: No one; affects main)"
     ]
     assert findings[0].kind is FindingKind.PUSH_PERMISSION
     assert findings[0].link == LINK
 
 
+def test_wildcard_rule_lists_all_affected_branches():
+    protected = [rule("release/*", level(60, "Admins"), level(40, "nils", user_id=7))]
+    findings = check_push_permissions("p", protected, ["main", "release/1", "release/2"], LINK)
+    assert [f.message for f in findings] == [
+        "protected branch release/* does not allow Maintainers to push "
+        "(allowed to push: Admins, nils; affects release/1, release/2)"
+    ]
+
+
 def test_rules_for_branches_that_are_not_synced_are_ignored():
-    findings = check_push_permissions(
-        "p", project(40), USER, [rule("main", {"access_level": 0})], ["dev"], LINK
-    )
-    assert findings == []
+    assert check_push_permissions("p", [rule("main", level(0, "No one"))], ["dev"], LINK) == []
 
 
-def test_wildcard_rule_and_group_only_rule():
-    protected = [rule("release/*", {"access_level": 50}), rule("main", {"group_id": 3, "access_level": 40})]
-    findings = check_push_permissions("p", project(40), USER, protected, ["main", "release/1"], LINK)
-    assert [f.message for f in findings] == [
-        "user dev (maintainer) may not push to protected branch release/* (affects release/1)",
-        "protected branch main only allows pushes for groups; whether user dev is a member was not "
-        "checked (affects main)",
-    ]
-
-
-def test_user_without_developer_access_gets_one_finding():
-    findings = check_push_permissions("p", project(20), USER, [rule("main")], ["main"], LINK)
-    assert [f.message for f in findings] == [
-        "user dev has reporter access and cannot push to this project at all"
-    ]
+def test_describe_push_access_without_descriptions():
+    assert describe_push_access(rule("m", level(0), level(40))) == "Maintainers, No one"
+    assert describe_push_access(rule("m")) == "No one"

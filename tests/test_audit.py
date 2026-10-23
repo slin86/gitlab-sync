@@ -89,8 +89,6 @@ def test_check_project_records_findings_and_continues_after_api_errors(tmp_path,
     old = FakeAuditApi("old", branch_names=["main", "wip/x"], environments=ApiError("down"))
     new = FakeAuditApi(
         "new",
-        project={"permissions": {"project_access": {"access_level": 40}}},
-        current_user={"id": 1, "username": "dev"},
         protected_branches=[{"name": "*", "push_access_levels": [{"access_level": 0}]}],
     )
     audit = Audit(audit_cfg(tmp_path, permissions=True, project_objects=True), old, new)
@@ -140,13 +138,11 @@ def test_build_audit(tmp_path, monkeypatch):
 def test_audit_api_requests():
     client = mock.Mock(host="h")
     client.get_all.return_value = [{"path_with_namespace": "a/b"}]
-    client.get.return_value = (200, {"id": 1, "username": "dev"}, {})
     api = AuditApi(client)
     assert api.project_paths(archived=True) == {"a/b"}
     client.get_all.assert_called_with("/projects", {"simple": "true", "archived": "true"})
-    assert api.current_user()["username"] == "dev"
-    api.current_user()
-    assert client.get.call_count == 1
+    api.protected_branches("grp/sub/repo")
+    client.get_all.assert_called_with("/projects/grp%2Fsub%2Frepo/protected_branches")
 
 
 @pytest.mark.parametrize(

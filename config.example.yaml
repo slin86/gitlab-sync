@@ -50,8 +50,8 @@ protected_branches_page: "/-/settings/repository#js-protected-branches-settings"
 #   repositories: projects that exist on the old instance but not on the new one, and projects
 #     whose archive status differs. Compares all projects the tokens can see; namespaces limits
 #     this to the listed groups.
-#   permissions: before anything is pushed, checks whether the user of the new instance token may
-#     push to the protected branches that exist on the old instance.
+#   permissions: before anything is pushed, checks whether the protected branch rules on the new
+#     instance allow Maintainers to push to the branches that exist on the old instance.
 #   project_objects: differences of pipeline schedules, feature flags (state and strategies) and
 #     environments. Variable values are never written to the document, only their keys.
 # Uses the tokens and connection settings of api_precheck below; read_api is enough on both sides.

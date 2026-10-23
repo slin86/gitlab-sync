@@ -12,31 +12,16 @@ class AuditApi:
 
     def __init__(self, client: GitLabClient):
         self.client = client
-        self._user: dict[str, Any] | None = None
 
     @property
     def host(self) -> str:
         return self.client.host
-
-    def current_user(self) -> dict[str, Any]:
-        if self._user is None:
-            status, user, _ = self.client.get("/user", {})
-            if status == 404 or not user:
-                raise ApiError(f"cannot read the token user on {self.host}")
-            self._user = user
-        return self._user
 
     def project_paths(self, archived: bool) -> set[str]:
         """Paths of all projects the token can see, either archived or active ones."""
         query = {"simple": "true", "archived": "true" if archived else "false"}
         projects = self.client.get_all("/projects", query) or []
         return {p["path_with_namespace"] for p in projects}
-
-    def project(self, project: str) -> dict[str, Any]:
-        status, data, _ = self.client.get(f"/projects/{project_id(project)}", {})
-        if status == 404:
-            raise ApiError(f"project {project} not found on {self.host}")
-        return data
 
     def branch_names(self, project: str) -> list[str]:
         heads = self.client.branch_heads(project)

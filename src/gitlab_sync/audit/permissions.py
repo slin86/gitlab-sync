@@ -1,4 +1,8 @@
-"""Check up front whether the token user may push to the branches that the sync would push."""
+"""Check up front whether the protected branch rules let Maintainers push.
+
+The check only reads the rules of the protected branches. It does not look at the membership of the
+token user, because inherited group memberships are not reliably visible on the project.
+"""
 
 from __future__ import annotations
 
@@ -7,72 +11,41 @@ from typing import Any
 
 from gitlab_sync.results import Finding, FindingKind
 
-DEVELOPER = 30
-OWNER = 50
-ACCESS_NAMES = {0: "no access", 10: "guest", 20: "reporter", 30: "developer", 40: "maintainer", 50: "owner"}
+MAINTAINER = 40
+LEVEL_NAMES = {0: "No one", 30: "Developers and Maintainers", 40: "Maintainers", 60: "Admins"}
 
 
-def access_level(project: dict[str, Any], user: dict[str, Any]) -> int:
-    """Highest of project and group access. Instance admins are treated like owners."""
-    permissions = project.get("permissions") or {}
-    level = max(
-        (permissions.get(scope) or {}).get("access_level") or 0
-        for scope in ("project_access", "group_access")
-    )
-    if user.get("is_admin"):
-        level = max(level, OWNER)
-    return level
-
-
-def push_allowed(rule: dict[str, Any], level: int, user_id: int) -> bool | None:
-    """True or False, or None when only group based entries could allow it."""
-    entries = rule.get("push_access_levels") or []
-    for entry in entries:
-        if entry.get("user_id") == user_id:
+def maintainers_may_push(rule: dict[str, Any]) -> bool:
+    """True if a role entry of the rule allows Maintainers. GitLab grants every role above the level."""
+    for entry in rule.get("push_access_levels") or []:
+        is_role_entry = not any(entry.get(key) for key in ("user_id", "group_id", "deploy_key_id"))
+        level = entry.get("access_level") or 0
+        if is_role_entry and 0 < level <= MAINTAINER:
             return True
-        is_role_entry = not any(entry.get(k) for k in ("user_id", "group_id", "deploy_key_id"))
-        required = entry.get("access_level") or 0
-        if is_role_entry and required and level >= required:
-            return True
-    if any(entry.get("group_id") for entry in entries):
-        return None
     return False
 
 
-def check_push_permissions(
-    project_path: str,
-    project: dict[str, Any],
-    user: dict[str, Any],
-    protected: list[dict[str, Any]],
-    branches: list[str],
-    settings_link: str,
-) -> list[Finding]:
-    """Findings for protected branches that exist on the old instance but cannot be pushed to."""
-    level = access_level(project, user)
-    username = user.get("username", "?")
-    role = ACCESS_NAMES.get(level, f"level {level}")
-    if level < DEVELOPER:
-        message = f"user {username} has {role} access and cannot push to this project at all"
-        return [Finding(FindingKind.PUSH_PERMISSION, project_path, message, settings_link)]
+def describe_push_access(rule: dict[str, Any]) -> str:
+    """Who may push according to the rule, using the descriptions GitLab returns."""
+    names = []
+    for entry in rule.get("push_access_levels") or []:
+        name = entry.get("access_level_description") or LEVEL_NAMES.get(entry.get("access_level") or 0)
+        names.append(name or f"level {entry.get('access_level')}")
+    return ", ".join(sorted(set(names))) or "No one"
 
+
+def check_push_permissions(
+    project_path: str, protected: list[dict[str, Any]], branches: list[str], settings_link: str
+) -> list[Finding]:
+    """One finding per protected branch rule that blocks Maintainers on branches the sync pushes."""
     findings = []
     for rule in protected:
         matching = [b for b in branches if fnmatch.fnmatchcase(b, rule["name"])]
-        if not matching:
+        if not matching or maintainers_may_push(rule):
             continue
-        allowed = push_allowed(rule, level, user.get("id"))
-        if allowed:
-            continue
-        affected = ", ".join(matching)
-        if allowed is None:
-            message = (
-                f"protected branch {rule['name']} only allows pushes for groups; "
-                f"whether user {username} is a member was not checked (affects {affected})"
-            )
-        else:
-            message = (
-                f"user {username} ({role}) may not push to protected branch {rule['name']} "
-                f"(affects {affected})"
-            )
+        message = (
+            f"protected branch {rule['name']} does not allow Maintainers to push "
+            f"(allowed to push: {describe_push_access(rule)}; affects {', '.join(matching)})"
+        )
         findings.append(Finding(FindingKind.PUSH_PERMISSION, project_path, message, settings_link))
     return findings

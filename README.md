@@ -116,10 +116,10 @@ the first repo with exit code 2.
 * `repositories`: lists all projects the tokens can see on both instances, active and archived, and
   reports projects that are missing on the new instance and projects whose archive status differs.
   `namespaces` limits the comparison to the given groups.
-* `permissions`: reads the access level of the token user on the new project and the protected
-  branches. A protected branch that exists on the old instance and does not allow the user to push is
-  reported with a link to the settings page. Rules that only allow groups are reported as not
-  verified, and instance admins are treated like owners.
+* `permissions`: reads the protected branch rules of the new project and reports every rule that
+  does not allow Maintainers to push to a branch that exists on the old instance, for example when
+  "Allowed to push and merge" is set to "No one" or only lists users or groups. The finding names who
+  may push and links to the settings page. The membership of the token user is not checked.
 * `project_objects`: compares pipeline schedules (matched by description and branch: cron, timezone,
   active state, variable keys and whether their values differ), feature flags (matched by name:
   active state, description, strategies with environment scopes) and environments (matched by name:

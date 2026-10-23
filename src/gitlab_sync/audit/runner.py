@@ -74,8 +74,6 @@ class Audit:
         ]
         return check_push_permissions(
             project,
-            self.new.project(project),
-            self.new.current_user(),
             self.new.protected_branches(project),
             branches,
             self._new_link(project, self.cfg.protected_branches_page),
