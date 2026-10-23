@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
+from gitlab_sync.audit import Audit
 from gitlab_sync.config import Config
 from gitlab_sync.git import Git, GitError
 from gitlab_sync.gitlab_api import ApiError
@@ -28,8 +29,13 @@ def sync_repo(
     perf: PerfTracker | None = None,
     old_url: str | None = None,
     precheck: Precheck | None = None,
+    audit: Audit | None = None,
 ) -> RepoOutcome:
-    """Sync one checkout. old_url overrides the URL derived from origin, mainly for tests."""
+    """Sync one checkout. old_url overrides the URL derived from origin, mainly for tests.
+
+    The audit runs first, so permission problems show up before any push is tried, and it also runs
+    when the precheck skips the git part.
+    """
     git = Git(path, cfg.git_timeout, perf)
     ctx = RepoContext(path, cfg, git, log, result, depth + 1)
     problems_before = result.problem_count
@@ -45,9 +51,11 @@ def sync_repo(
     except UrlError as exc:
         ctx.fail(ctx.depth, f"{exc}, repo skipped")
         return RepoOutcome.PROBLEM
+    if audit:
+        audit.check_project(path, new_url, log, ctx.depth, result)
     if precheck and not _old_has_changes(ctx, precheck, new_url):
         result.repos_skipped += 1
-        return RepoOutcome.SKIPPED
+        return RepoOutcome.SKIPPED if result.problem_count == problems_before else RepoOutcome.PROBLEM
 
     try:
         _prepare(ctx, new_url, expected_old_url)

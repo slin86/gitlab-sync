@@ -54,6 +54,29 @@ class RollbackInstruction:
     tags: list[str]
 
 
+class FindingKind(Enum):
+    """Categories of the findings document, in the order they appear there."""
+
+    MISSING_REPO = "Repositories missing on the new instance"
+    ARCHIVE_STATUS = "Archive status differences"
+    PUSH_PERMISSION = "Push permission problems"
+    TAG = "Tag differences"
+    LOCAL_BRANCH = "Local branches with unpublished commits"
+    SCHEDULE = "Pipeline schedule differences"
+    FEATURE_FLAG = "Feature flag differences"
+    ENVIRONMENT = "Environment differences"
+
+
+@dataclass(frozen=True)
+class Finding:
+    """Something a developer should look at. subject is the project or repo path."""
+
+    kind: FindingKind
+    subject: str
+    message: str
+    link: str | None = None
+
+
 @dataclass
 class RunResult:
     repos: int = 0
@@ -71,6 +94,7 @@ class RunResult:
     branch_conflicts: list[BranchConflict] = field(default_factory=list)
     protected_pushes: list[ProtectedPush] = field(default_factory=list)
     rollbacks: list[RollbackInstruction] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
 
     @property
     def problem_count(self) -> int:

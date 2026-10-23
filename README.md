@@ -29,7 +29,7 @@ python -m gitlab_sync -c config.yaml            # same without the console scrip
 ```
 
 Exit codes: 0 when everything was fine, 1 when a repo had errors or conflicts, 2 when the config is
-invalid or the root directory does not exist.
+invalid, the root directory does not exist or an audit check is enabled without API tokens.
 
 ## What happens per repo
 
@@ -50,6 +50,10 @@ The flow is drawn in [docs/flow.md](docs/flow.md) ([overall](docs/flow_overall.p
    when `overwrite_tags` is set, otherwise only reported.
 5. The previously checked out branch is checked out again.
 
+When the audit is enabled, its project checks run first for every repo, also when the precheck skips
+the git part, so permission problems show up before any push is tried. The comparison of the project
+lists of both instances runs once before the first repo.
+
 The tool never deletes a branch or tag and never force pushes a branch. Branches that only exist on the
 new instance are left alone. A local branch with unpublished commits is skipped with a warning.
 
@@ -69,7 +73,17 @@ Syncing folder /work/gitlab (12 repos)
             -> Syncing 123 commits from git-old to origin (fast forward)
 ```
 
-The following files are written next to the log file. Their names can be changed in the config. The
+The main result is `findings.md`, one document with everything that needs attention. It is replaced
+on every run and is complete in a dry run as well. It starts with an overview and has one section per
+category; a category whose check is disabled says so instead of showing "None":
+
+* repositories missing on the new instance, archive status differences, push permission problems
+* merge conflicts, rejected pushes to protected branches, Jenkins rollbacks needed
+* tag differences, local branches with unpublished commits
+* pipeline schedule, feature flag and environment differences
+* errors and other warnings
+
+The following files are written next to the log file as well. Their names can be changed in the config. The
 lists are appended to and skip entries that are already present.
 
 * `branch_conflicts.txt`: branches that could not be merged, one line per branch and state:
@@ -92,6 +106,26 @@ With `api_precheck.enabled` the tool asks the API of both instances before touch
 The repo is skipped when nothing is missing on the new instance. Tokens with scope `read_api` are read
 from `GITLAB_NEW_TOKEN` and `GITLAB_OLD_TOKEN`. When the check is not possible the repo gets a full sync
 and the log contains a warning.
+
+## Audit
+
+The audit only reads from both instances and never changes anything. It needs `GITLAB_OLD_TOKEN` and
+`GITLAB_NEW_TOKEN` with scope `read_api`; when a check is enabled without tokens the run stops before
+the first repo with exit code 2.
+
+* `repositories`: lists all projects the tokens can see on both instances, active and archived, and
+  reports projects that are missing on the new instance and projects whose archive status differs.
+  `namespaces` limits the comparison to the given groups.
+* `permissions`: reads the access level of the token user on the new project and the protected
+  branches. A protected branch that exists on the old instance and does not allow the user to push is
+  reported with a link to the settings page. Rules that only allow groups are reported as not
+  verified, and instance admins are treated like owners.
+* `project_objects`: compares pipeline schedules (matched by description and branch: cron, timezone,
+  active state, variable keys and whether their values differ), feature flags (matched by name:
+  active state, description, strategies with environment scopes) and environments (matched by name:
+  external URL, tier, state). Variable values are never written to the document.
+
+The checks cost a few API requests per repo, plus one per pipeline schedule to read its variables.
 
 ## Jenkins rollback instructions
 
@@ -134,6 +168,8 @@ src/gitlab_sync/
   config.py       configuration model and YAML loader
   runner.py       walks all repos and writes summary, reports and timings
   sync/           sync of one repo: repo.py, branch.py, tags.py, jenkins.py
+  audit/          read only checks: repositories, permissions, project objects
+  findings.py     the findings document
   precheck.py     API precheck
   gitlab_api.py   minimal GitLab API client
   git.py          git command wrapper
@@ -147,6 +183,7 @@ src/gitlab_sync/
 
 ## Limitations
 
-* Repos that were created on the old instance but do not exist on the new one yet are not handled.
+* Repos that were created on the old instance but do not exist on the new one yet are only reported
+  by the audit, not created.
 * The diagrams in `docs/flow.md` are the source; the PNG and SVG files have to be rendered again after a
   change, for example with `mmdc` from `@mermaid-js/mermaid-cli`.

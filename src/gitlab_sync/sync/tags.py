@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from gitlab_sync.git import GitError
+from gitlab_sync.results import FindingKind
 from gitlab_sync.sync.context import RepoContext
 
 OLD_TAGS_NAMESPACE = "refs/gitlab_sync/old_tags"
@@ -35,7 +36,12 @@ def _sync_fetched_tags(ctx: RepoContext) -> None:
         if local == sha:
             continue
         if local is not None and not ctx.cfg.overwrite_tags:
-            ctx.warn(depth, f"Tag {tag} differs between {ctx.old} and {ctx.new}, not overwritten")
+            ctx.finding(
+                depth,
+                FindingKind.TAG,
+                f"Tag {tag} differs between {ctx.old} ({sha[:10]}) and {ctx.new} ({local[:10]}), "
+                "not overwritten",
+            )
             continue
         targets[tag] = sha
         previous[tag] = local

@@ -1,3 +1,4 @@
+from gitlab_sync.results import FindingKind
 from tests.conftest import git
 
 
@@ -6,7 +7,10 @@ def test_changed_tag_is_only_reported_by_default(world):
     new_v1 = git(world.new, "rev-parse", "v1")
     _, result = world.sync()
     assert git(world.new, "rev-parse", "v1") == new_v1 != old_v1
-    assert any("Tag v1" in w for w in result.warnings)
+    (finding,) = result.findings
+    assert finding.kind is FindingKind.TAG
+    assert finding.subject == "grp/repo"
+    assert finding.message.startswith(f"Tag v1 differs between git-old ({old_v1[:10]}) and origin")
 
 
 def test_changed_tag_is_overwritten_when_enabled(world):

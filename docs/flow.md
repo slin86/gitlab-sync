@@ -7,12 +7,14 @@ Rendered images: [overall flow](flow_overall.png) and [flow per branch](flow_bra
 
 ```mermaid
 flowchart TD
-    start(["Start: load config, find repos below root<br/>(.git, include, exclude, --only)"]) --> nextrepo{"Next repo?"}
-    nextrepo -- "no" --> finish(["Summary, report files,<br/>performance report, exit code"])
+    start(["Start: load config, find repos below root<br/>(.git, include, exclude, --only)"]) --> repos["Audit: compare project lists<br/>(missing repos, archive status)"]
+    repos --> nextrepo{"Next repo?"}
+    nextrepo -- "no" --> finish(["Summary, findings.md, report files,<br/>performance report, exit code"])
     nextrepo -- "yes" --> url["Read origin URL<br/>old URL = host replaced"]
     url --> hostok{"origin host is<br/>new_host?"}
     hostok -- "no" --> err1["Log error,<br/>skip repo"] --> nextrepo
-    hostok -- "yes" --> pre{"api_precheck<br/>enabled?"}
+    hostok -- "yes" --> audit["Audit: push permissions,<br/>schedules, feature flags, environments<br/>(read only)"]
+    audit --> pre{"api_precheck<br/>enabled?"}
 
     pre -- "yes" --> api["API: compare branches and tags<br/>of both instances"]
     api --> news{"Old instance has something new<br/>or the check failed?"}

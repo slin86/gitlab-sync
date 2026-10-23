@@ -1,5 +1,5 @@
 from gitlab_sync.gitlab_api import ApiError
-from gitlab_sync.results import RepoOutcome
+from gitlab_sync.results import FindingKind, RepoOutcome
 from tests.conftest import PROTECTED_REJECTION, commit, git
 
 
@@ -48,7 +48,8 @@ def test_local_branch_with_unpublished_commits_is_skipped(world):
     before = git(world.new, "rev-parse", "main")
     _, result = world.sync()
     assert git(world.new, "rev-parse", "main") == before
-    assert any("Local branch main" in w for w in result.warnings)
+    assert [f.kind for f in result.findings] == [FindingKind.LOCAL_BRANCH]
+    assert result.warnings == []
 
 
 def test_precheck_without_changes_skips_the_repo_entirely(world):

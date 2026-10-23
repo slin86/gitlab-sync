@@ -77,3 +77,13 @@ def test_cli_reports_config_errors(tmp_path, capsys):
     config.write_text("root: x\n")
     assert main(["-c", str(config)]) == 2
     assert "missing required keys" in capsys.readouterr().out
+
+
+def test_audit_without_tokens_exits_with_2(world, monkeypatch):
+    monkeypatch.delenv("GITLAB_NEW_TOKEN", raising=False)
+    monkeypatch.delenv("GITLAB_OLD_TOKEN", raising=False)
+    world.cfg.audit.permissions = True
+    before = git(world.new, "for-each-ref")
+    assert run_world(world) == 2
+    assert git(world.new, "for-each-ref") == before
+    assert "the audit needs API tokens" in world.cfg.log_file.read_text()

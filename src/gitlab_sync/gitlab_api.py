@@ -1,4 +1,4 @@
-"""Minimal read only client for the GitLab REST API v4."""
+"""Minimal read only client for the GitLab REST API v4. The tool never writes through the API."""
 
 from __future__ import annotations
 
@@ -13,16 +13,34 @@ from gitlab_sync.perf import PerfTracker
 PAGE_SIZE = 100
 
 
+ENDPOINT_KINDS = (
+    "branches",
+    "tags",
+    "refs",
+    "protected_branches",
+    "pipeline_schedules",
+    "feature_flags",
+    "environments",
+    "projects",
+    "user",
+)
+
+
 class ApiError(RuntimeError):
     """The API could not be reached or answered with an unexpected status."""
 
 
 def endpoint_kind(path: str) -> str:
-    if path.endswith("/tags"):
-        return "tags"
-    if path.endswith("/branches"):
-        return "branches"
-    return "commit-refs"
+    """Resource name used as timing category, e.g. branches or pipeline_schedules."""
+    for segment in reversed(path.strip("/").split("/")):
+        if segment in ENDPOINT_KINDS:
+            return "commit_refs" if segment == "refs" else segment
+    return "project" if path.startswith("/projects/") else "other"
+
+
+def project_id(project: str) -> str:
+    """URL encoded project path for use in /projects/:id."""
+    return quote(project, safe="")
 
 
 class GitLabClient:
@@ -50,12 +68,12 @@ class GitLabClient:
         except (URLError, OSError, ValueError) as exc:
             raise ApiError(f"{self.host}{path}: {exc}") from exc
 
-    def get_all(self, path: str) -> list | None:
+    def get_all(self, path: str, query: dict[str, Any] | None = None) -> list | None:
         """Follow X-Next-Page until the last page. Returns None if the resource does not exist."""
         items: list = []
         page = 1
         while page:
-            status, data, headers = self.get(path, {"per_page": PAGE_SIZE, "page": page})
+            status, data, headers = self.get(path, {**(query or {}), "per_page": PAGE_SIZE, "page": page})
             if status == 404:
                 return None
             items.extend(data)
@@ -82,4 +100,4 @@ class GitLabClient:
 
 
 def _repository(project: str) -> str:
-    return f"/projects/{quote(project, safe='')}/repository"
+    return f"/projects/{project_id(project)}/repository"

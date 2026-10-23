@@ -7,8 +7,10 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+from gitlab_sync.audit import Audit, MissingTokenError, build_audit
 from gitlab_sync.config import Config
 from gitlab_sync.discovery import find_repos
+from gitlab_sync.findings import write_findings
 from gitlab_sync.log import TreeLog
 from gitlab_sync.perf import PerfTracker, SlowCall, format_duration, network_seconds
 from gitlab_sync.precheck import Precheck, build_precheck
@@ -21,7 +23,7 @@ from gitlab_sync.results import RepoOutcome, RunResult
 from gitlab_sync.summary import log_perf_report, log_summary
 from gitlab_sync.sync import sync_repo
 
-EXIT_ROOT_MISSING = 2
+EXIT_SETUP_ERROR = 2
 
 OldUrlOverride = Callable[[Path], "str | None"]
 
@@ -51,10 +53,12 @@ def run(
     console: bool = True,
     old_url_override: OldUrlOverride | None = None,
     precheck: Precheck | None = None,
+    audit: Audit | None = None,
 ) -> int:
     """Sync every selected repo and write the summary, the report files and the timings.
 
-    Returns 0 on success, 1 if any repo had errors or conflicts and 2 if the root is missing.
+    Returns 0 on success, 1 if any repo had errors or conflicts and 2 if the root is missing or an
+    audit check is enabled without API tokens.
     """
     started = datetime.now()
     start = time.perf_counter()
@@ -65,11 +69,18 @@ def run(
         log.info(0, f"gitlab_sync started at {started:%Y-%m-%d %H:%M:%S}, mode: {mode}")
         if not cfg.root.is_dir():
             log.error(0, f"Root directory not found: {cfg.root}")
-            return EXIT_ROOT_MISSING
+            return EXIT_SETUP_ERROR
+        try:
+            audit = audit or build_audit(cfg, perf)
+        except MissingTokenError as exc:
+            log.error(0, str(exc))
+            return EXIT_SETUP_ERROR
 
         repos = find_repos(cfg.root, cfg.include, cfg.exclude, only)
         log.info(0, f"Syncing folder {cfg.root} ({len(repos)} repos)")
         result = RunResult()
+        if audit:
+            audit.check_repositories(log, result)
         tree = FolderTree(log)
         for repo in repos:
             rel = repo.relative_to(cfg.root)
@@ -79,7 +90,15 @@ def run(
             with perf.repo(rel.as_posix()) as timing:
                 old_url = old_url_override(repo) if old_url_override else None
                 outcome = sync_repo(
-                    repo, cfg, log, depth, result, perf=perf, old_url=old_url, precheck=precheck
+                    repo,
+                    cfg,
+                    log,
+                    depth,
+                    result,
+                    perf=perf,
+                    old_url=old_url,
+                    precheck=precheck,
+                    audit=audit,
                 )
             timing.status = outcome.value
             log.info(
@@ -96,6 +115,9 @@ def run(
             "rollbacks": write_rollback_instructions(cfg, result.rollbacks),
         }
         log_summary(log, result, files)
+        written = write_findings(cfg, result, started)
+        if written:
+            log.info(0, f"Findings: {written[1]} written to {written[0]}")
         log_perf_report(log, perf, cfg, time.perf_counter() - start)
         perf_path = cfg.output_path(cfg.perf_file)
         if perf_path and perf.repos:

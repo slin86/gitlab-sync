@@ -35,6 +35,23 @@ class JenkinsRollbackConfig:
 
 
 @dataclass
+class AuditConfig:
+    """Read only API checks whose results go to the findings document.
+
+    Uses the token and connection settings of api_precheck; read_api is enough on both instances.
+    """
+
+    repositories: bool = False
+    permissions: bool = False
+    project_objects: bool = False
+    namespaces: list[str] = field(default_factory=list)
+
+    @property
+    def enabled(self) -> bool:
+        return self.repositories or self.permissions or self.project_objects
+
+
+@dataclass
 class Config:
     root: Path
     new_host: str
@@ -52,11 +69,13 @@ class Config:
     conflicts_file: str = "branch_conflicts.txt"
     protected_branches_file: str = "protected_branches.md"
     protected_branches_page: str = "/-/settings/repository#js-protected-branches-settings"
+    findings_file: str = "findings.md"
     perf_file: str = "performance.csv"
     perf_top: int = 10
     slow_command_seconds: float = 30.0
     api_precheck: ApiPrecheckConfig = field(default_factory=ApiPrecheckConfig)
     jenkins_rollback: JenkinsRollbackConfig = field(default_factory=JenkinsRollbackConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
     def output_path(self, name: str) -> Path | None:
         """Resolve an output file name relative to the log directory. An empty name disables it."""
@@ -93,6 +112,7 @@ def load_config(path: Path) -> Config:
     if data.get("perf_file") is None and "perf_file" in data:
         data["perf_file"] = ""
     data["api_precheck"] = _build(ApiPrecheckConfig, data.get("api_precheck"), "api_precheck")
+    data["audit"] = _build(AuditConfig, data.get("audit"), "audit")
     data["jenkins_rollback"] = _build(JenkinsRollbackConfig, data.get("jenkins_rollback"), "jenkins_rollback")
     return _build(Config, data, "top level")
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from gitlab_sync.git import GitError
-from gitlab_sync.results import BranchConflict, ProtectedPush, RollbackInstruction
+from gitlab_sync.results import BranchConflict, FindingKind, ProtectedPush, RollbackInstruction
 from gitlab_sync.sync.context import RepoContext
 from gitlab_sync.sync.jenkins import find_rollback
 
@@ -28,7 +28,11 @@ def sync_branch(ctx: RepoContext, branch: str) -> None:
     count = git.count(f"{new_ref}..{old_ref}")
     local_sha = git.resolve(f"refs/heads/{branch}")
     if local_sha and local_sha != new_sha and not git.is_ancestor(local_sha, new_sha):
-        ctx.warn(depth, f"Local branch {branch} has commits that are not on {ctx.new}, skipped")
+        ctx.finding(
+            depth,
+            FindingKind.LOCAL_BRANCH,
+            f"Local branch {branch} has commits that are not on {ctx.new}, skipped",
+        )
         return
 
     ctx.log.info(depth, f"Checking out branch {branch}")

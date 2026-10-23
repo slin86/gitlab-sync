@@ -50,11 +50,15 @@ class World:
     repo: Path
     cfg: Config
 
-    def sync(self, dry_run: bool = False, precheck: Precheck | None = None) -> tuple[RepoOutcome, RunResult]:
+    def sync(
+        self, dry_run: bool = False, precheck: Precheck | None = None, audit=None
+    ) -> tuple[RepoOutcome, RunResult]:
         self.cfg.dry_run = dry_run
         result = RunResult()
         with TreeLog(self.cfg.log_file, console=False) as log:
-            outcome = sync_repo(self.repo, self.cfg, log, 1, result, old_url=str(self.old), precheck=precheck)
+            outcome = sync_repo(
+                self.repo, self.cfg, log, 1, result, old_url=str(self.old), precheck=precheck, audit=audit
+            )
         return outcome, result
 
     def heads(self, bare: Path) -> list[str]:

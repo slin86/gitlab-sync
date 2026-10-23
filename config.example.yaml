@@ -45,6 +45,23 @@ jenkins_rollback:
 protected_branches_file: protected_branches.md
 protected_branches_page: "/-/settings/repository#js-protected-branches-settings"
 
+# Audit: read only API checks. Nothing is changed on either instance; every result goes to the
+# findings document. Runs in a dry run as well.
+#   repositories: projects that exist on the old instance but not on the new one, and projects
+#     whose archive status differs. Compares all projects the tokens can see; namespaces limits
+#     this to the listed groups.
+#   permissions: before anything is pushed, checks whether the user of the new instance token may
+#     push to the protected branches that exist on the old instance.
+#   project_objects: differences of pipeline schedules, feature flags (state and strategies) and
+#     environments. Variable values are never written to the document, only their keys.
+# Uses the tokens and connection settings of api_precheck below; read_api is enough on both sides.
+audit:
+  repositories: true
+  permissions: true
+  project_objects: true
+  namespaces: []
+    # e.g. [team-a, team-b/backend]
+
 # API precheck: compares branches and tags of both instances through the GitLab API before any
 # fetch and skips the repo when the old instance has nothing new. Tokens with scope read_api are
 # read from environment variables, never from this file. If the check fails (missing token, network
@@ -57,6 +74,11 @@ api_precheck:
   timeout: 15
 
 log_file: gitlab_sync.log
+
+# One Markdown document with all findings of the run: audit results, merge conflicts, rejected
+# pushes, Jenkins rollbacks, tag differences, errors and warnings. Replaced on every run, also in a
+# dry run. Leave empty to disable.
+findings_file: findings.md
 
 # Branches that could not be merged are appended here, one line per branch and state.
 conflicts_file: branch_conflicts.txt

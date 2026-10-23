@@ -8,7 +8,7 @@ from pathlib import Path
 from gitlab_sync.config import Config
 from gitlab_sync.git import Git, GitError
 from gitlab_sync.log import TreeLog
-from gitlab_sync.results import RunResult
+from gitlab_sync.results import Finding, FindingKind, RunResult
 
 
 @dataclass
@@ -42,9 +42,10 @@ class RepoContext:
     def new_url(self) -> str:
         return self.git.remote_url(self.new) or ""
 
-    def warn(self, depth: int, message: str) -> None:
+    def finding(self, depth: int, kind: FindingKind, message: str) -> None:
+        """Log a warning and record it for the findings document."""
         self.log.warning(depth, message)
-        self.result.warnings.append(f"{self.path}: {message}")
+        self.result.findings.append(Finding(kind, self.cfg.relative_repo(self.path), message))
 
     def fail(self, depth: int, message: str) -> None:
         self.log.error(depth, message)
